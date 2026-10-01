@@ -32,6 +32,10 @@ if IS_WIN:
     MONITORENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC,
                                          ctypes.POINTER(RECT), wintypes.LPARAM)
     user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    for _f in (user32.IsWindowVisible, user32.IsIconic, user32.IsZoomed):
+        _f.argtypes = [wintypes.HWND]
+    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
+    kernel32.GetTickCount.restype = wintypes.DWORD
     user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
     user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
     user32.GetMonitorInfoW.argtypes = [wintypes.HMONITOR, ctypes.POINTER(MONITORINFOEXW)]
