@@ -94,8 +94,8 @@ def run_gui() -> None:
             from cutout import get_detector, get_session, process
 
             try:
-                self.progress.emit(0, len(self.files), "載入 AI 去背模型（第一次會下載約 170MB，請稍候）…")
-                sess = get_session(self.hq)
+                self.progress.emit(0, len(self.files), "載入 AI 模型…（第一次會下載，畫面停住是正常的）")
+                sess = get_session(self.hq, lambda m: self.progress.emit(0, len(self.files), m))
                 det = get_detector(lambda m: self.progress.emit(0, len(self.files), m))
             except Exception as e:
                 self.progress.emit(0, len(self.files), f"模型下載失敗，請檢查網路後再試：{e}")

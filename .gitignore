@@ -4,3 +4,4 @@ pets/
 models/
 settings.json
 *.part
+.cache/

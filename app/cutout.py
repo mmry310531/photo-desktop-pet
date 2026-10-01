@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -68,9 +69,14 @@ def get_detector(progress=None):
         if not f.exists() or f.stat().st_size < 30_000_000:
             if progress:
                 progress("下載動物偵測模型（約 36MB，只需一次）…")
-            tmp = f.with_suffix(".part")
-            urllib.request.urlretrieve(DETECTOR_URL, tmp)
-            tmp.replace(f)
+            try:
+                import fastdl
+
+                fastdl.download(DETECTOR_URL, f)
+            except Exception:
+                tmp = f.with_suffix(".part")
+                urllib.request.urlretrieve(DETECTOR_URL, tmp)
+                tmp.replace(f)
         _detector = ort.InferenceSession(str(f), providers=["CPUExecutionProvider"])
     return _detector
 
@@ -112,10 +118,24 @@ def detect_pet(img: Image.Image, det) -> tuple[tuple[int, int, int, int], str, f
     return box, PET_CLASSES[ids[int(best_cls[i])]], float(best[i])
 
 
-def get_session(high_quality: bool = False):
+def get_session(high_quality: bool = False, progress=None):
+    import fastdl
+
+    # 模型放在專案的 models/ 底下，並用多線程下載（比 rembg 內建的單線程快很多）
+    os.environ["U2NET_HOME"] = str(_model_dir() / "u2net")
+    name = "birefnet-general" if high_quality else "isnet-general-use"
+    url, rel, md5 = fastdl.BIREFNET if high_quality else fastdl.MODELS[0]
+    target = _model_dir() / rel
+    if not target.exists():
+        if progress:
+            progress(f"下載去背模型 {target.name}（只需一次）…")
+        try:
+            fastdl.download(url, target, md5=md5)
+        except Exception:
+            pass  # 交給 rembg 自己下載
+
     from rembg import new_session
 
-    name = "birefnet-general" if high_quality else "isnet-general-use"
     if name not in _sessions:
         _sessions[name] = new_session(name)
     return _sessions[name]
