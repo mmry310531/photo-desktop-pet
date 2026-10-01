@@ -151,48 +151,113 @@ def pil_to_pixmap(im, scale, dpr, mirror):
     return pm
 
 
-class Sprite:
-    def __init__(self, pm_right, pm_left, pose):
-        self.right, self.left, self.pose = pm_right, pm_left, pose
-        self.w = pm_right.width() / pm_right.devicePixelRatio()
-        self.h = pm_right.height() / pm_right.devicePixelRatio()
+class Unit:
+    """一段動作：一張靜止照片（1 格），或從影片做出的連續動畫（很多格）。
+
+    kind: still = 靜止照片；loop = 可循環動作（走路、呼吸、搖尾巴）；trans = 轉場（坐下、趴下、起身）
+    每一格：(朝右的圖, 朝左的圖, 朝右時的錨點 x, 寬, 高)
+    """
+
+    def __init__(self, frames, fps, pose, kind="still", to=None):
+        self.frames, self.fps, self.pose, self.kind, self.to = frames, fps or 10, pose, kind, to
+        self.w = max(f[3] for f in frames)
+        self.h = max(f[4] for f in frames)
+        # 舊程式碼相容
+        self.right, self.left = frames[0][0], frames[0][1]
+
+    @property
+    def animated(self):
+        return len(self.frames) > 1
+
+    def duration(self):
+        return len(self.frames) / self.fps
+
+    def frame_at(self, t, loop=True, reverse=False):
+        n = len(self.frames)
+        i = int(t * self.fps)
+        i = i % n if loop else min(i, n - 1)
+        return self.frames[n - 1 - i if reverse else i]
+
+
+POSES_ALL = ("walk", "sit", "lie")
+# 每種行為需要的身體姿勢
+POSE_FOR = {"walk": "walk", "chase": "walk", "look": "walk", "sit": "sit", "stretch": "sit", "sleep": "lie"}
 
 
 def load_sprites(name, settings, dpr):
+    """讀寵物包 → (loops: {姿勢: [Unit]}, trans: {(從, 到): [(Unit, 是否倒放)]}, pack)"""
+    import numpy as np
     from PIL import Image
-
-    from cutout import match_brightness
 
     pack = load_pack(name)
     d = pack_dir(name)
-    ims, metas = [], []
+    entries = []
     for m in pack["images"]:
         try:
-            ims.append(Image.open(d / m["file"]).convert("RGBA"))
-            metas.append(m)
+            if m.get("frames"):
+                ims = [(Image.open(d / f["file"]).convert("RGBA"), f.get("ax")) for f in m["frames"]]
+            else:
+                ims = [(Image.open(d / m["file"]).convert("RGBA"), None)]
+            entries.append((m, ims))
         except Exception:
             pass
-    if not ims:
-        return {}, pack
-    ims = match_brightness(ims)
+    if not entries:
+        return {}, {}, pack
+
+    def lum(im):
+        arr = np.asarray(im).astype(np.float32)
+        msk = arr[:, :, 3] > 128
+        return float(arr[:, :, :3][msk].mean()) if msk.any() else 128.0
+
+    lums = [lum(ims[len(ims) // 2][0]) for _, ims in entries]
+    target_l = float(np.median(lums))
     base = settings.get("base_px", 130) * settings.get("size", 1.0)
     target_area = base * base * 0.55
-    sprites = {"walk": [], "sit": [], "lie": []}
-    for im, m in zip(ims, metas):
-        area = m.get("area") or int((__import__("numpy").asarray(im.getchannel("A")) > 128).sum())
-        s = math.sqrt(target_area / max(area, 1))
-        s = min(s, base * 1.5 / im.height, base * 2.2 / im.width)
+    loops = {k: [] for k in POSES_ALL}
+    trans = {}
+    for (m, ims), l in zip(entries, lums):
+        gain = float(np.clip(1 + 0.5 * (target_l / max(l, 1) - 1), 0.75, 1.35))  # 亮度往整組中間拉
+        mid = ims[len(ims) // 2][0]
+        if m.get("kind") == "trans":
+            # 轉場：用開頭幾格的大小對齊，接上前後動作時才不會忽大忽小
+            area = float(np.mean([(np.asarray(im.getchannel("A")) > 128).sum() for im, _ in ims[:3]]))
+        else:
+            area = m.get("area") or int((np.asarray(mid.getchannel("A")) > 128).sum())
+        sc = math.sqrt(target_area / max(area, 1))
+        maxh = max(im.height for im, _ in ims)
+        maxw = max(im.width for im, _ in ims)
+        sc = min(sc, base * 1.5 / maxh, base * 2.4 / maxw)
         facing_right = m.get("facing", "right") == "right"
-        # pm_right = 頭朝右的版本
-        right = pil_to_pixmap(im, s, dpr, mirror=not facing_right)
-        left = pil_to_pixmap(im, s, dpr, mirror=facing_right)
-        sprites.setdefault(m.get("pose", "walk"), []).append(Sprite(right, left, m.get("pose", "walk")))
-    # 缺的姿勢互相補
-    allsp = [s for v in sprites.values() for s in v]
-    sprites["walk"] = sprites["walk"] or sprites["sit"] or allsp
-    sprites["sit"] = sprites["sit"] or sprites["walk"]
-    sprites["lie"] = sprites["lie"] or sprites["sit"]
-    return sprites, pack
+        frames = []
+        for im, ax in ims:
+            if gain != 1.0:
+                arr = np.asarray(im).astype(np.float32)
+                arr[:, :, :3] = np.clip(arr[:, :, :3] * gain, 0, 255)
+                im = Image.fromarray(arr.astype(np.uint8), "RGBA")
+            if ax is None:  # 靜止照片：錨點用身體質心
+                solid = np.asarray(im.getchannel("A")) > 128
+                ax = float(np.where(solid)[1].mean()) if solid.any() else im.width / 2
+            right = pil_to_pixmap(im, sc, dpr, mirror=not facing_right)
+            left = pil_to_pixmap(im, sc, dpr, mirror=facing_right)
+            w, h = right.width() / dpr, right.height() / dpr
+            axr = ax * sc if facing_right else w - ax * sc
+            frames.append((right, left, axr, w, h))
+        pose = m.get("pose", "walk")
+        kind = m.get("kind") or ("loop" if len(frames) > 1 else "still")
+        if kind == "trans" and m.get("to") in POSES_ALL and m.get("to") != pose:
+            u = Unit(frames, m.get("fps"), pose, "trans", m["to"])
+            trans.setdefault((pose, m["to"]), []).append((u, False))
+            trans.setdefault((m["to"], pose), []).append((u, True))  # 倒放：坐下 ↔ 起身
+            # 轉場的頭尾也可以當靜止姿勢
+            loops[pose].append(Unit([frames[0]], 10, pose))
+            loops[m["to"]].append(Unit([frames[-1]], 10, m["to"]))
+        else:
+            loops.setdefault(pose, []).append(Unit(frames, m.get("fps"), pose, kind))
+    allu = [u for v in loops.values() for u in v]
+    loops["walk"] = loops["walk"] or loops["sit"] or allu
+    loops["sit"] = loops["sit"] or loops["walk"]
+    loops["lie"] = loops["lie"] or loops["sit"]
+    return loops, trans, pack
 
 
 # ======================================================================= 特效
@@ -238,7 +303,13 @@ class Pet(QWidget):
         self.speed = 90.0
         self.squash = 0.0
         self.energy = random.uniform(0.6, 1.0)
-        self.sprite = random.choice(self.sprites["sit"])
+        self.pose = "walk"
+        self.sprite = self.pick_loop("walk")
+        self.unit_t = 0.0
+        self.unit_loop, self.unit_rev = True, False
+        self.queue = []
+        self.pending = None
+        self.fade_from, self.fade_t, self.fade_len = None, 0.0, 0.2
         self.target_x = None
         self.edge_choice = None
         self.drag_off = QPointF()
@@ -254,10 +325,10 @@ class Pet(QWidget):
     # ---------------- 載入
     def load(self):
         dpr = self.screen().devicePixelRatio() if self.screen() else 1.0
-        self.sprites, self.pack = load_sprites(self.name, self.ctrl.settings, dpr)
+        self.sprites, self.trans, self.pack = load_sprites(self.name, self.ctrl.settings, dpr)
         if not self.sprites:
             raise RuntimeError(f"{self.name} 沒有任何圖片")
-        allsp = [s for v in self.sprites.values() for s in v]
+        allsp = [s for v in self.sprites.values() for s in v] + [u for v in self.trans.values() for u, _ in v]
         mw = max(s.w for s in allsp)
         mh = max(s.h for s in allsp)
         self.W = int(max(mw, mh) * 1.5 + 40)
@@ -266,21 +337,116 @@ class Pet(QWidget):
         self.setFixedSize(self.W, self.H)
         self.phrases = self.pack.get("phrases") or ["喵～"]
         if hasattr(self, "sprite"):
-            self.sprite = random.choice(self.sprites[self.sprite.pose if self.sprite.pose in self.sprites else "sit"])
+            self.queue, self.pending = [], None
+            self.sprite = self.pick_loop(self.pose)
+            self.unit_t, self.unit_loop, self.unit_rev = 0.0, True, False
+
+    # ---------------- 動畫
+    def pick_loop(self, pose):
+        units = self.sprites.get(pose) or self.sprites["sit"]
+        anim = [u for u in units if u.animated]
+        if anim and random.random() < 0.85:  # 有真的會動的影片就優先用
+            return random.choice(anim)
+        return random.choice(units)
+
+    def cur_frame(self):
+        return self.sprite.frame_at(self.unit_t, self.unit_loop, self.unit_rev)
+
+    @property
+    def fw(self):
+        return self.cur_frame()[3]
+
+    @property
+    def fh(self):
+        return self.cur_frame()[4]
+
+    def play(self, unit, loop=True, reverse=False, fade=0.18):
+        """換一段動作；新舊畫面淡入淡出，不會硬切。"""
+        if unit is self.sprite and loop == self.unit_loop and reverse == self.unit_rev:
+            return
+        if fade > 0 and getattr(self, "sprite", None) is not None:
+            self.fade_from = (self.cur_frame(), self.dir)
+            self.fade_t = self.fade_len = fade
+        self.sprite, self.unit_t, self.unit_loop, self.unit_rev = unit, 0.0, loop, reverse
+
+    def plan(self, a, b):
+        """找從姿勢 a 到 b 的路線（例如 走→坐→躺）。
+
+        有轉場影片的步驟用影片（代價 1），沒有的用淡入淡出補（代價 3），
+        所以「走→坐」沒影片、「坐→躺」有影片時，會先淡到坐、再真的趴下去。
+        回傳步驟清單：(Unit, 是否倒放) 或 ("fade", 姿勢)。
+        """
+        import heapq
+
+        best = {a: (0, [])}
+        heap = [(0, a, [])]
+        while heap:
+            cost, cur, path = heapq.heappop(heap)
+            if cur == b:
+                return path
+            if cost > best.get(cur, (1e9,))[0]:
+                continue
+            for nxt in POSES_ALL:
+                if nxt == cur:
+                    continue
+                lst = self.trans.get((cur, nxt))
+                # 淡入淡出的代價看姿勢差多遠（走→躺 比 走→坐 遠），優先走「有真實轉場」的路
+                gap = abs(POSES_ALL.index(cur) - POSES_ALL.index(nxt))
+                step, c = ((random.choice(lst)), 1) if lst else (("fade", nxt), 1 + 2 * gap)
+                nc = cost + c
+                if nc < best.get(nxt, (1e9,))[0]:
+                    best[nxt] = (nc, path + [step])
+                    heapq.heappush(heap, (nc, nxt, path + [step]))
+        return None
+
+    def start_step(self, step):
+        if step[0] == "fade":
+            self.play(self.pick_loop(step[1]), fade=0.35)
+            self.step_len = 0.45
+            self.step_to = step[1]
+        else:
+            u, rev = step
+            self.play(u, loop=False, reverse=rev, fade=0.1)
+            self.step_len = u.duration()
+            self.step_to = u.pose if rev else u.to
 
     # ---------------- 狀態切換
     def set_state(self, st, length=None):
+        length = length if length is not None else 3.0
+        need = self.pose if st == "petted" else POSE_FOR.get(st, self.pose)
+        if self.grounded() and need != self.pose:
+            path = self.plan(self.pose, need)
+            if path and any(step[0] != "fade" for step in path):  # 用真實的轉場動作過去（坐下、趴下、起身…）
+                self.queue = path
+                self.pending = (st, length)
+                self.state, self.state_t = "trans", 0.0
+                self.start_step(self.queue.pop(0))
+                return
+            self.play(self.pick_loop(need), fade=0.35)  # 完全沒有轉場影片：慢一點淡過去
+        elif self.sprite.pose != need or self.sprite.kind == "trans" or random.random() < 0.4:
+            self.play(self.pick_loop(need))
+        self.pose = need
         self.state, self.state_t = st, 0.0
-        self.state_len = length if length is not None else 3.0
-        if st in ("walk", "chase", "flee"):
-            self.sprite = random.choice(self.sprites["walk"])
-        elif st in ("sit", "petted", "look", "stretch"):
-            self.sprite = random.choice(self.sprites["sit"])
-        elif st == "sleep":
-            self.sprite = random.choice(self.sprites["lie"])
+        self.state_len = length
+
+    def trans_tick(self):
+        """這一步轉場播完 → 下一步，或進入原本要做的事。"""
+        if self.unit_t < self.step_len:
+            return
+        self.pose = self.step_to or self.pose
+        if self.queue:
+            self.start_step(self.queue.pop(0))
+            return
+        st, length = self.pending or ("sit", 3.0)
+        self.pending = None
+        self.state = None
+        self.set_state(st, length)
 
     def grounded(self):
         return self.state not in ("fall", "drag")
+
+    def interrupt(self):
+        self.queue, self.pending = [], None
 
     def start_fall(self, vx=None, vy=0.0):
         self.support = None
@@ -288,8 +454,10 @@ class Pet(QWidget):
         self.vy = vy
         self.state = "fall"
         self.state_t = 0
-        if self.sprite.pose == "lie":
-            self.sprite = random.choice(self.sprites["walk"])
+        self.interrupt()
+        if self.pose != "walk" or not self.unit_loop:
+            self.pose = "walk"
+            self.play(self.pick_loop("walk"), fade=0.1)
 
     def summon_drop(self):
         g = QApplication.primaryScreen().availableGeometry()
@@ -301,7 +469,7 @@ class Pet(QWidget):
         self.bubble = (text, secs)
 
     def emit(self, text, n=1, color=QColor(255, 80, 120), size=16, spread=30, vy=-60):
-        top = self.y - self.sprite.h
+        top = self.y - self.fh
         for _ in range(n):
             self.particles.append(Particle(text, self.x + random.uniform(-spread, spread),
                                            top + random.uniform(-5, 15), random.uniform(-15, 15),
@@ -327,8 +495,11 @@ class Pet(QWidget):
         if st == "walk":
             if random.random() < 0.6:
                 self.dir = random.choice([-1, 1])
-            self.speed = random.uniform(55, 110) if random.random() < 0.8 else random.uniform(180, 260)
             self.set_state("walk", random.uniform(2.5, 8))
+            if self.sprite.animated:  # 用影片走路：速度配合步伐
+                self.speed = self.sprite.w * 0.9 * (random.uniform(0.8, 1.15) if random.random() < 0.8 else 1.9)
+            else:
+                self.speed = random.uniform(55, 110) if random.random() < 0.8 else random.uniform(180, 260)
         elif st == "sit":
             self.set_state("sit", random.uniform(4, 12))
         elif st == "look":
@@ -337,8 +508,8 @@ class Pet(QWidget):
         elif st == "sleep":
             self.set_state("sleep", random.uniform(15, 50) if idle < 90 else random.uniform(60, 180))
         elif st == "chase":
-            self.speed = random.uniform(150, 230)
             self.set_state("chase", 6)
+            self.speed = (self.sprite.w * 1.6) if self.sprite.animated else random.uniform(150, 230)
         elif st == "climb":
             self.jump_to(self.climb_target())
 
@@ -372,7 +543,17 @@ class Pet(QWidget):
         self.state_t += dt
         self.squash = max(0.0, self.squash - dt * 3)
         b = self.world.bounds()
-        half = self.sprite.w / 2
+        half = self.fw / 2
+        # 動畫時間：走路的影片會跟移動速度同步（腳步不會滑），掉落／被拎著時暫停
+        if self.state not in ("fall", "drag"):
+            rate = 1.0
+            if self.state in ("walk", "chase") and self.sprite.animated:
+                rate = max(0.4, min(2.5, self.speed / max(self.sprite.w * 0.9, 1)))
+            elif self.state == "sleep":
+                rate = 0.8
+            self.unit_t += dt * rate
+        if self.fade_t > 0:
+            self.fade_t = max(0.0, self.fade_t - dt)
 
         idle = winenv.idle_seconds()
         if idle > 90:
@@ -431,13 +612,17 @@ class Pet(QWidget):
         self.support_ref = self.world.win_rects.get(s.hwnd) if s.hwnd else None
         self.vx = self.vy = 0
         self.squash = max(self.squash, 0.35)
-        self.set_state("sit", random.uniform(0.8, 2.0))
+        self.pose = "walk"
+        self.set_state("look", random.uniform(0.6, 1.5))
 
     def ground_tick(self, dt):
         st = self.state
         self.energy = min(1.0, self.energy + dt * (0.02 if st == "sleep" else 0.0)) - (dt * 0.004 if st in ("walk", "chase") else 0)
         self.energy = max(0.0, self.energy)
 
+        if st == "trans":
+            self.trans_tick()
+            return
         if st in ("walk", "chase"):
             if st == "chase":
                 mx = QCursor.pos().x()
@@ -517,13 +702,18 @@ class Pet(QWidget):
         p.setRenderHint(QPainter.Antialiasing)
         p.setRenderHint(QPainter.SmoothPixmapTransform)
         cx, fy = self.W / 2, self.H - self.FOOT
-        sp = self.sprite
-        pm = sp.right if self.dir > 0 else sp.left
+        fr = self.cur_frame()
+        pm = fr[0] if self.dir > 0 else fr[1]
+        fax = fr[2] if self.dir > 0 else fr[3] - fr[2]
+        fwid, fht = fr[3], fr[4]
+        anim = self.sprite.animated
         sx = sy = 1.0
         rot = 0.0
         off = 0.0
         st = self.state
-        if st in ("walk", "chase"):
+        if anim and st not in ("fall", "drag", "petted"):
+            pass  # 真實影片動畫：不再加假的晃動
+        elif st in ("walk", "chase"):
             k = min(1.0, self.speed / 120)
             off = -abs(math.sin(self.phase)) * 5 * k
             rot = math.sin(self.phase) * 2.5 * self.dir
@@ -540,7 +730,7 @@ class Pet(QWidget):
             v = max(-1, min(1, self.vy / 2000))
             sy, sx = 1 + 0.1 * abs(v), 1 - 0.07 * abs(v)
             rot = max(-20, min(20, self.vx / 60))
-        elif st != "drag":
+        elif st not in ("drag", "trans"):
             sy = 1 + 0.018 * math.sin(self.t * 2.4)
             sx = 1 - 0.008 * math.sin(self.t * 2.4)
         if self.squash > 0:
@@ -552,20 +742,30 @@ class Pet(QWidget):
         if self.grounded():
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(0, 0, 0, 45))
-            p.drawEllipse(QPointF(cx, fy), sp.w * 0.38 * sx, 5)
+            p.drawEllipse(QPointF(cx, fy), fwid * 0.38 * sx, 5)
 
-        p.save()
-        if st == "drag":
-            # 被拎著：以抓的點為支點晃
-            p.translate(cx, fy - sp.h)
-            p.rotate(self.drag_rot)
-            p.drawPixmap(QRectF(-sp.w / 2, 0, sp.w, sp.h), pm, QRectF(pm.rect()))
+        def draw(pm, ax, w, h, opacity):
+            p.save()
+            p.setOpacity(opacity)
+            if st == "drag":
+                # 被拎著：以抓的點為支點晃
+                p.translate(cx, fy - h)
+                p.rotate(self.drag_rot)
+                p.drawPixmap(QRectF(-ax, 0, w, h), pm, QRectF(pm.rect()))
+            else:
+                p.translate(cx, fy + off)
+                p.rotate(rot)
+                p.scale(sx, sy)
+                p.drawPixmap(QRectF(-ax, -h, w, h), pm, QRectF(pm.rect()))
+            p.restore()
+
+        if self.fade_t > 0 and self.fade_from:
+            (ofr, odir) = self.fade_from
+            k = self.fade_t / max(self.fade_len, 1e-3)
+            draw(ofr[0] if odir > 0 else ofr[1], ofr[2] if odir > 0 else ofr[3] - ofr[2], ofr[3], ofr[4], k)
+            draw(pm, fax, fwid, fht, 1 - k * 0.6)
         else:
-            p.translate(cx, fy + off)
-            p.rotate(rot)
-            p.scale(sx, sy)
-            p.drawPixmap(QRectF(-sp.w / 2, -sp.h, sp.w, sp.h), pm, QRectF(pm.rect()))
-        p.restore()
+            draw(pm, fax, fwid, fht, 1.0)
 
         # 粒子：愛心、Zzz…
         ox, oy = self.x - cx, self.y - fy
@@ -586,7 +786,7 @@ class Pet(QWidget):
             p.setFont(f)
             fm = p.fontMetrics()
             tw, th = fm.horizontalAdvance(text) + 18, fm.height() + 10
-            top = fy - sp.h * sy - th - 14
+            top = fy - fht * sy - th - 14
             r = QRectF(cx - tw / 2, max(2, top), tw, th)
             path = QPainterPath()
             path.addRoundedRect(r, 9, 9)
@@ -603,7 +803,7 @@ class Pet(QWidget):
         if e.button() == Qt.LeftButton:
             self.press_pos = e.globalPosition()
             self.press_time = time.time()
-            self.drag_off = QPointF(e.globalPosition().x() - self.x, e.globalPosition().y() - (self.y - self.sprite.h))
+            self.drag_off = QPointF(e.globalPosition().x() - self.x, e.globalPosition().y() - (self.y - self.fh))
             self.drag_samples = [(time.time(), e.globalPosition())]
         elif e.button() == Qt.RightButton:
             self.ctrl.build_menu(self).exec(e.globalPosition().toPoint())
@@ -615,7 +815,9 @@ class Pet(QWidget):
                 self.dragging = True
                 self.state = "drag"
                 self.support = None
-                self.sprite = random.choice(self.sprites["walk"])
+                self.interrupt()
+                self.pose = "walk"
+                self.play(self.pick_loop("walk"), fade=0.1)
                 self.drag_off = QPointF(0, 0)
                 if random.random() < 0.5:
                     self.say(random.choice(["放我下來！", "咦？", "喵！？"]))
@@ -624,7 +826,7 @@ class Pet(QWidget):
                 self.drag_rot = max(-35, min(35, self.drag_rot * 0.7 - (g.x() - prev.x()) * 0.9))
                 self.drag_samples = (self.drag_samples + [(time.time(), g)])[-6:]
                 self.x = g.x()
-                self.y = g.y() + self.sprite.h
+                self.y = g.y() + self.fh
                 self.place()
                 self.update()
         else:
@@ -750,7 +952,7 @@ class Controller:
         if not self.tray:
             return
         if self.pets:
-            pm = self.pets[0].sprites["sit"][0].right
+            pm = self.pets[0].sprites["sit"][0].frames[0][0]
             self.tray.setIcon(QIcon(pm))
         self.tray.setContextMenu(self.build_menu(None))
         self.tray.show()

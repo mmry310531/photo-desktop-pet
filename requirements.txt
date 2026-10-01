@@ -4,3 +4,4 @@ pillow>=10
 pillow-heif>=0.16
 numpy
 scipy
+imageio-ffmpeg>=0.5

@@ -28,18 +28,32 @@ def save_results(name: str, results, pack: dict) -> dict:
             n += 1
             fname = f"{int(time.time())}_{n:03d}.png"
         used.add(fname)
-        r.image.save(d / fname, optimize=True)
-        pack["images"].append({
-            "file": fname, "pose": r.pose, "facing": r.facing,
-            "area": r.area, "hash": str(r.hash), "source": Path(r.source).name,
-        })
+        entry = {"file": fname, "pose": r.pose, "facing": r.facing,
+                 "area": r.area, "hash": str(r.hash), "source": Path(r.source).name}
+        if r.frames:  # 影片 -> 連續動畫：每一格各存一張
+            stem = fname[:-4]
+            entry["fps"] = r.fps
+            entry["kind"] = r.extra.get("kind", "loop")
+            if entry["kind"] == "trans":
+                entry["to"] = r.extra["to"]
+            if r.extra.get("ai"):
+                entry["ai"] = True
+            entry["frames"] = []
+            for k, (im, ax) in enumerate(r.frames):
+                ff = f"{stem}_f{k:03d}.png"
+                im.save(d / ff, optimize=True)
+                entry["frames"].append({"file": ff, "ax": round(ax, 1)})
+            entry["file"] = entry["frames"][0]["file"]
+        else:
+            r.image.save(d / fname, optimize=True)
+        pack["images"].append(entry)
     pack["name"] = name
     save_pack(name, pack)
     return pack
 
 
 def run_cli(argv: list[str]) -> None:
-    from cutout import collect_images, get_detector, get_session, process
+    from cutout import collect_images, get_detector, get_session, process_any
 
     hq = "--hq" in argv
     argv = [a for a in argv if a != "--hq"]
@@ -49,14 +63,18 @@ def run_cli(argv: list[str]) -> None:
     name, paths = safe_name(argv[0]), argv[1:]
     pack = load_pack(name)
     files = collect_images(paths)
-    print(f"找到 {len(files)} 張照片，載入 AI 去背模型（第一次會下載約 170MB）…")
+    print(f"找到 {len(files)} 個照片／影片，載入 AI 模型…")
     sess = get_session(hq)
     det = get_detector(print)
     hashes = [int(im["hash"]) for im in pack["images"] if im.get("hash")]
     good = []
     for i, f in enumerate(files, 1):
-        r = process(f, sess, hashes, det)
-        tag = r.error or f"{r.extra.get('detected', '')} {POSES[r.pose]}，面向{'左' if r.facing == 'left' else '右'} {r.warning}"
+        r = process_any(f, sess, hashes, det, lambda m: print("  " + m, end="\r"))
+        clip = ""
+        if r.frames:
+            k = r.extra.get("kind")
+            clip = f"🎞 {len(r.frames)} 格{'轉場→' + POSES[r.extra['to']] if k == 'trans' else '循環'} "
+        tag = r.error or f"{clip}{r.extra.get('detected', '')} {POSES[r.pose]}，面向{'左' if r.facing == 'left' else '右'} {r.warning}"
         print(f"[{i}/{len(files)}] {f.name}: {tag}")
         if r.image is not None:
             good.append(r)
@@ -91,7 +109,7 @@ def run_gui() -> None:
             self.stop = False
 
         def run(self):
-            from cutout import get_detector, get_session, process
+            from cutout import get_detector, get_session, process_any
 
             try:
                 self.progress.emit(0, len(self.files), "載入 AI 模型…（第一次會下載，畫面停住是正常的）")
@@ -106,7 +124,8 @@ def run_gui() -> None:
                 if self.stop:
                     break
                 self.progress.emit(i - 1, len(self.files), f"處理中：{f.name}")
-                r = process(f, sess, self.hashes, det)
+                r = process_any(f, sess, self.hashes, det,
+                                lambda m, i=i: self.progress.emit(i - 1, len(self.files), m))
                 if r.image is not None:
                     ok += 1
                     self.hashes.append(r.hash)
@@ -140,8 +159,8 @@ def run_gui() -> None:
             top.addStretch()
             lay.addLayout(top)
 
-            self.hint = QLabel("① 把寵物照片（或整個資料夾）拖進這個視窗，或按下方按鈕加入。"
-                               "照片越多、姿勢越多樣（坐、站、躺），牠在桌面上的動作就越豐富。\n"
+            self.hint = QLabel("① 把寵物照片、影片（或整個資料夾）拖進這個視窗，或按下方按鈕加入。"
+                               "姿勢越多樣（坐、站、躺）越好；🎞 側面走路 3～5 秒的影片會變成真的會動腳的連續動畫。\n"
                                "② 按「開始訓練」：AI 會自動去背、判斷姿勢。③ 檢查結果，右鍵可修正姿勢/面向/刪除。④ 按「儲存並召喚」。")
             self.hint.setWordWrap(True)
             lay.addWidget(self.hint)
@@ -190,8 +209,8 @@ def run_gui() -> None:
             self.enqueue([u.toLocalFile() for u in e.mimeData().urls()])
 
         def add_files(self):
-            fs, _ = QFileDialog.getOpenFileNames(self, "選擇寵物照片", "",
-                                                 "圖片 (*.jpg *.jpeg *.png *.webp *.heic *.heif *.bmp)")
+            fs, _ = QFileDialog.getOpenFileNames(self, "選擇寵物照片或影片", "",
+                                                 "照片或影片 (*.jpg *.jpeg *.png *.webp *.heic *.heif *.bmp *.mp4 *.mov *.m4v *.avi *.mkv *.webm *.gif)")
             self.enqueue(fs)
 
         def add_folder(self):
@@ -229,7 +248,12 @@ def run_gui() -> None:
             pose = obj["pose"] if kind == "old" else obj.pose
             facing = obj["facing"] if kind == "old" else obj.facing
             warn = "" if kind == "old" else (" ⚠" if obj.warning else "")
-            it.setText(f"{POSES[pose]} · 頭朝{'←' if facing == 'left' else '→'}{warn}"
+            nframes = len(obj.get("frames", [])) if kind == "old" else len(obj.frames)
+            ckind = obj.get("kind") if kind == "old" else obj.extra.get("kind")
+            to = obj.get("to") if kind == "old" else obj.extra.get("to")
+            clip = f"🎞{nframes}格 " if nframes else ""
+            posetxt = f"{POSES[pose]}→{POSES[to]}" if ckind == "trans" and to else POSES[pose]
+            it.setText(f"{clip}{posetxt} · 頭朝{'←' if facing == 'left' else '→'}{warn}"
                        + ("" if kind == "old" else " 🆕"))
             if kind == "new" and obj.warning:
                 it.setToolTip(obj.warning)
@@ -340,7 +364,8 @@ def run_gui() -> None:
                 o = old.get(im["file"])
                 if o is None:  # 被刪掉
                     try:
-                        (pack_dir(name) / im["file"]).unlink()
+                        for fn in [im["file"]] + [fr["file"] for fr in im.get("frames", [])]:
+                            (pack_dir(name) / fn).unlink(missing_ok=True)
                     except OSError:
                         pass
                     continue

@@ -24,6 +24,8 @@ except Exception:
     pass
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic", ".heif", ".tif", ".tiff"}
+VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".3gp", ".gif"}
+MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS
 OUT_HEIGHT = 360  # 存檔高度（顯示時再依面積縮放）
 
 
@@ -35,6 +37,8 @@ class CutResult:
     facing: str = "right"  # 頭朝哪邊
     area: int = 0          # 不透明像素數（用來讓各張看起來一樣大）
     hash: int = 0
+    frames: list = field(default_factory=list)   # 影片：[(PIL 圖, 錨點 x)]
+    fps: float = 0.0
     warning: str = ""
     error: str = ""
     extra: dict = field(default_factory=dict)
@@ -147,8 +151,8 @@ def collect_images(paths) -> list[Path]:
     out: list[Path] = []
     for p in map(Path, paths):
         if p.is_dir():
-            out += sorted(q for q in p.rglob("*") if q.suffix.lower() in IMAGE_EXTS)
-        elif p.suffix.lower() in IMAGE_EXTS:
+            out += sorted(q for q in p.rglob("*") if q.suffix.lower() in MEDIA_EXTS)
+        elif p.suffix.lower() in MEDIA_EXTS:
             out.append(p)
     seen, uniq = set(), []
     for p in out:
@@ -300,3 +304,186 @@ def match_brightness(images: list[Image.Image], strength: float = 0.5) -> list[I
         arr[:, :, :3] = np.clip(arr[:, :, :3] * g, 0, 255)
         out.append(Image.fromarray(arr.astype(np.uint8), "RGBA"))
     return out
+
+
+# ================================================================ 影片 -> 連續動畫
+VIDEO_FPS = 10        # 每秒取幾格
+VIDEO_MAX_SECS = 6    # 最多處理幾秒
+VIDEO_W = 640
+
+
+def read_video_frames(path: Path, fps=VIDEO_FPS, max_secs=VIDEO_MAX_SECS):
+    """用 ffmpeg 取出影格（手機直拍影片會自動轉正）。"""
+    import imageio_ffmpeg
+
+    gen = imageio_ffmpeg.read_frames(
+        str(path), pix_fmt="rgb24",
+        output_params=["-vf", f"fps={fps},scale={VIDEO_W}:-2", "-t", str(max_secs)])
+    next(gen)  # 第一個是 metadata
+    frames = []
+    for raw in gen:
+        h = len(raw) // (VIDEO_W * 3)
+        frames.append(Image.frombytes("RGB", (VIDEO_W, h), bytes(raw)))
+    return frames
+
+
+def _cut_frame(img, session, detector, last_box):
+    """單一影格去背；偵測不到時沿用上一格的位置。回傳 (alpha, box, 原圖 RGBA) 或 None。"""
+    from rembg import remove
+
+    found = detect_pet(img, detector) if detector is not None else None
+    box = found[0] if found else last_box
+    if box is None:
+        return None
+    bx0, by0, bx1, by1 = box
+    mx, my = int((bx1 - bx0) * 0.15) + 8, int((by1 - by0) * 0.15) + 8
+    cx0, cy0 = max(0, bx0 - mx), max(0, by0 - my)
+    cx1, cy1 = min(img.width, bx1 + mx), min(img.height, by1 + my)
+    crop = img.crop((cx0, cy0, cx1, cy1))
+    cut = remove(crop, session=session)
+    a = np.asarray(cut.getchannel("A")).copy()
+    a[a < 24] = 0
+    a = _largest_component(a)
+    if (a > 128).sum() < (bx1 - bx0) * (by1 - by0) * 0.2:
+        return None
+    rgba = np.dstack([np.asarray(cut)[:, :, :3], a])
+    return a, box, rgba
+
+
+def _best_loop(masks, min_len=6):
+    """找出頭尾最像的一段，讓動畫循環播放時接得順。"""
+    n = len(masks)
+    if n <= min_len:
+        return 0, n
+    best, bi, bj = -1.0, 0, n
+    for i in range(n):
+        for j in range(i + min_len, n + 1):
+            k = j % n if j == n else j
+            if j == n:
+                continue
+            inter = np.logical_and(masks[i], masks[k]).sum()
+            union = np.logical_or(masks[i], masks[k]).sum() or 1
+            score = inter / union + 0.006 * (j - i)
+            if score > best:
+                best, bi, bj = score, i, j
+    return bi, bj
+
+
+def _pose_of(frames_alpha):
+    """幾格畫面的多數決姿勢。"""
+    votes = [classify(a)[0] for a in frames_alpha]
+    return max(set(votes), key=votes.count)
+
+
+def process_video(path: Path, session, detector, progress=None, force: dict | None = None,
+                  max_secs=VIDEO_MAX_SECS) -> CutResult:
+    """把一段寵物影片變成連續動畫。
+
+    自動判斷是「循環動作」（走路、坐著搖尾巴、睡覺呼吸）還是「轉場動作」（坐下、趴下、起身）：
+    開頭和結尾的姿勢不同就是轉場。force 可以直接指定（AI 生成的影片用）。
+    """
+    r = CutResult(source=str(path))
+    try:
+        frames = read_video_frames(path, max_secs=max_secs)
+        if len(frames) < 4:
+            r.error = "影片太短"
+            return r
+        cuts, boxes = [], []
+        last = None
+        for i, fr in enumerate(frames):
+            if progress:
+                progress(f"處理影片 {Path(path).name}：第 {i + 1}/{len(frames)} 格")
+            c = _cut_frame(fr, session, detector, last)
+            if c is None:
+                continue
+            a, box, rgba = c
+            last = box
+            cuts.append((a, rgba))
+            boxes.append(box)
+        if len(cuts) < 4:
+            r.error = "影片裡找不到清楚的寵物"
+            return r
+
+        tight = []
+        for a, rgba in cuts:
+            ys, xs = np.where(a > 24)
+            y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+            tight.append(rgba[y0:y1, x0:x1])
+        areas = np.array([(t[:, :, 3] > 128).sum() for t in tight], dtype=float)
+        # 去掉被擋住、去背失敗的格（跟前後格比，不跟整段比——轉場時面積本來就會變）
+        keep = np.ones(len(tight), dtype=bool)
+        for i in range(len(tight)):
+            nb = areas[max(0, i - 3):i + 4]
+            keep[i] = abs(areas[i] - np.median(nb)) < np.median(nb) * 0.4
+        tight = [t for t, k in zip(tight, keep) if k]
+        boxes = [bx for bx, k in zip(boxes, keep) if k]
+        if len(tight) < 4:
+            r.error = "影片裡寵物被擋住或去背失敗太多格"
+            return r
+
+        # 整段用同一個縮放比例（不逐格縮放，坐下、趴下的高度變化才會保留）
+        sc = OUT_HEIGHT / max(t.shape[0] for t in tight)
+        out_frames, masks, alphas = [], [], []
+        for t in tight:
+            im = Image.fromarray(t, "RGBA")
+            im = im.resize((max(1, round(im.width * sc)), max(1, round(im.height * sc))), Image.LANCZOS)
+            al = np.asarray(im.getchannel("A"))
+            solid = al > 128
+            # 錨點用身體的質心，比框的中心穩（尾巴擺動不會讓整隻左右抖）
+            ax = float(np.where(solid)[1].mean()) if solid.any() else im.width / 2
+            out_frames.append((im, ax))
+            alphas.append(al)
+            m = Image.fromarray((solid * 255).astype(np.uint8)).resize((32, 32))
+            masks.append(np.asarray(m) > 127)
+
+        n = len(out_frames)
+        cxs = np.array([(bx[0] + bx[2]) / 2 for bx in boxes])
+        widths = np.array([bx[2] - bx[0] for bx in boxes])
+        travel = (cxs[-1] - cxs[0]) / max(np.median(widths), 1)
+        start_pose = _pose_of(alphas[: min(3, n)])
+        end_pose = _pose_of(alphas[-min(3, n):])
+        _, facing, info = classify(alphas[n // 2])
+        r.extra.update(info)
+        r.extra["travel"] = round(float(travel), 2)
+
+        if force:
+            kind = force["kind"]
+            start_pose, end_pose = force.get("from", start_pose), force.get("to", end_pose)
+            facing = force.get("facing", facing)
+        elif abs(travel) > 0.5:  # 在畫面裡移動了 → 走路循環
+            kind, start_pose = "loop", "walk"
+            end_pose = "walk"
+            facing = "right" if travel > 0 else "left"
+        elif start_pose != end_pose:
+            kind = "trans"
+        else:
+            kind = "loop"
+
+        if kind == "loop":
+            if force and force.get("seamless"):
+                i, j = 0, n - 1  # AI 用同一張圖當頭尾，本身就接得起來；最後一格跟第一格重複
+            else:
+                i, j = _best_loop(masks)
+            r.frames = out_frames[i:j]
+            r.pose = start_pose
+            if len(r.frames) < n * 0.5:
+                r.warning = "找到的循環段較短，動作可能不夠完整"
+        else:
+            r.frames = out_frames
+            r.pose = start_pose
+            r.extra["to"] = end_pose
+        r.extra["kind"] = kind
+        r.fps = VIDEO_FPS
+        r.facing = facing
+        r.image = r.frames[0][0]
+        r.area = int(np.median([(np.asarray(f.getchannel("A")) > 128).sum() for f, _ in r.frames]))
+        r.hash = dhash(out_frames[n // 2][0].convert("RGB"))
+    except Exception as e:
+        r.error = f"{type(e).__name__}: {e}"
+    return r
+
+
+def process_any(path: Path, session, hashes, detector, progress=None) -> CutResult:
+    if Path(path).suffix.lower() in VIDEO_EXTS:
+        return process_video(path, session, detector, progress)
+    return process(path, session, hashes, detector)
