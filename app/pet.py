@@ -9,7 +9,6 @@ from __future__ import annotations
 import math
 import os
 import random
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -23,7 +22,7 @@ from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget
 
 import winenv
-from common import ROOT, list_packs, load_pack, load_settings, pack_dir, pythonw, save_settings
+from common import launch, launch_cmd, list_packs, load_pack, load_settings, pack_dir, save_settings
 
 APP_KEY = "photo-desktop-pet-v1"
 GRAVITY = 2600.0  # px/s²
@@ -977,7 +976,7 @@ class Controller:
         sub = m.addMenu("再召喚一隻")
         for n in list_packs():
             act(n, lambda _=False, n=n: self.summon(n), menu=sub)
-        act("餵新照片（開啟訓練器）…", lambda: subprocess.Popen([pythonw(), str(ROOT / "app" / "trainer.py")], cwd=str(ROOT)))
+        act("餵新照片（開啟訓練器）…", lambda: launch("trainer"))
         m.addSeparator()
         size = m.addMenu("大小")
         for label, v in (("小", 0.7), ("中", 1.0), ("大", 1.4), ("特大", 2.0)):
@@ -1017,7 +1016,8 @@ class Controller:
         if f.exists():
             f.unlink()
         else:
-            f.write_text(f'CreateObject("WScript.Shell").Run """{pythonw()}"" ""{ROOT / "app" / "pet.py"}""", 0\r\n',
+            cmd = " ".join(f'""{a}""' if i < 2 else a for i, a in enumerate(launch_cmd("pet")))
+            f.write_text(f'CreateObject("WScript.Shell").Run "{cmd}", 0\r\n',
                          encoding="utf-16")
         self.update_tray()
 
@@ -1068,7 +1068,7 @@ def main():
     names = [n for n in names if n in list_packs()]
     if not names:
         # 還沒有寵物：直接打開訓練器
-        subprocess.Popen([pythonw(), str(ROOT / "app" / "trainer.py")])
+        launch("trainer")
         return
     for n in names:
         ctrl.summon(n)

@@ -7,7 +7,9 @@ import re
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+FROZEN = getattr(sys, "frozen", False)  # 打包成 .exe 時
+# 資料（寵物、模型、設定）放在：原始碼版 = 專案資料夾；exe 版 = exe 旁邊
+ROOT = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent.parent
 PETS_DIR = ROOT / "pets"
 SETTINGS_FILE = ROOT / "settings.json"
 
@@ -82,6 +84,19 @@ def load_settings() -> dict:
 
 def save_settings(s: dict) -> None:
     SETTINGS_FILE.write_text(json.dumps(s, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def launch_cmd(which: str, *args) -> list[str]:
+    """開啟另一個程式（trainer / pet）的指令。exe 版用同一個 exe 加參數。"""
+    if FROZEN:
+        return [sys.executable, f"--{which}", *args]
+    return [pythonw(), str(ROOT / "app" / f"{which}.py"), *args]
+
+
+def launch(which: str, *args):
+    import subprocess
+
+    return subprocess.Popen(launch_cmd(which, *args), cwd=str(ROOT))
 
 
 def pythonw() -> str:

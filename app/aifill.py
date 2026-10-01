@@ -55,33 +55,32 @@ def _animal(pack) -> str:
     return max(set(votes), key=votes.count) if votes else "pet"
 
 
+def pack_entries(pack) -> list[dict]:
+    return [{"pose": im["pose"], "kind": im.get("kind") or ("loop" if im.get("frames") else None),
+             "to": im.get("to"), "animated": bool(im.get("frames"))} for im in pack["images"]]
+
+
 def missing_jobs(name: str) -> list[Job]:
-    """看這隻寵物還缺哪些連續動作。"""
+    """看這隻寵物還缺哪些連續動作，而且有照片可以讓 AI 補。"""
+    import spec
+
     pack = load_pack(name)
     a = _animal(pack)
-    have_loop = {im["pose"] for im in pack["images"] if im.get("frames") and im.get("kind", "loop") == "loop"}
-    have_trans = set()
-    for im in pack["images"]:
-        if im.get("kind") == "trans":
-            have_trans.add(frozenset((im["pose"], im.get("to"))))
-    have_pose = {im["pose"] for im in pack["images"]} | {im.get("to") for im in pack["images"] if im.get("to")}
+    prompts = {
+        "loop:walk": ("走路（循環）", f"A {a} walking in place on a treadmill, side view, legs moving in a smooth natural "
+                                      f"walking cycle, the {a} stays in the center of the frame, {STYLE}"),
+        "loop:sit": ("坐著待機（循環）", f"A {a} sitting calmly, breathing, blinking, small head movements, "
+                                        f"tail gently moving, {STYLE}"),
+        "loop:lie": ("趴著睡覺（循環）", f"A {a} lying down asleep, slow gentle breathing, eyes closed, {STYLE}"),
+        "trans:walk>sit": ("坐下／站起來（轉場）", f"A standing {a} slowly sits down in place, {STYLE}"),
+        "trans:sit>lie": ("趴下／起身（轉場）", f"A sitting {a} slowly lies down in place, {STYLE}"),
+    }
     jobs = []
-    if "walk" in have_pose and "walk" not in have_loop:
-        jobs.append(Job("loop:walk", "loop", "walk", "walk", "走路（循環）",
-                        f"A {a} walking in place on a treadmill, side view, legs moving in a smooth natural walking cycle, "
-                        f"the {a} stays in the center of the frame, {STYLE}"))
-    if "sit" in have_pose and "sit" not in have_loop:
-        jobs.append(Job("loop:sit", "loop", "sit", "sit", "坐著待機（循環）",
-                        f"A {a} sitting calmly, breathing, blinking, small head movements, tail gently moving, {STYLE}"))
-    if "lie" in have_pose and "lie" not in have_loop:
-        jobs.append(Job("loop:lie", "loop", "lie", "lie", "趴著睡覺（循環）",
-                        f"A {a} lying down asleep, slow gentle breathing, eyes closed, {STYLE}"))
-    if {"walk", "sit"} <= have_pose and frozenset(("walk", "sit")) not in have_trans:
-        jobs.append(Job("trans:walk>sit", "trans", "walk", "sit", "坐下／站起來（轉場）",
-                        f"A standing {a} slowly sits down in place, {STYLE}"))
-    if {"sit", "lie"} <= have_pose and frozenset(("sit", "lie")) not in have_trans:
-        jobs.append(Job("trans:sit>lie", "trans", "sit", "lie", "趴下／起身（轉場）",
-                        f"A sitting {a} slowly lies down in place, {STYLE}"))
+    for code in spec.ai_fillable(spec.coverage(pack_entries(pack))):
+        kind, rest = code.split(":")
+        poses = rest.split(">")
+        label, prompt = prompts[code]
+        jobs.append(Job(code, kind, poses[0], poses[-1], label, prompt))
     return jobs
 
 

@@ -5,15 +5,14 @@ CLI：python trainer.py --cli 寵物名字 照片資料夾 [更多檔案或資�
 """
 from __future__ import annotations
 
-import subprocess
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from common import (POSES, PACK_EXT, ROOT, export_pack, import_pack, list_packs, load_pack,  # noqa: E402
-                    pack_dir, pythonw, safe_name, save_pack)
+from common import (POSES, PACK_EXT, export_pack, import_pack, launch, list_packs, load_pack,  # noqa: E402
+                    pack_dir, safe_name, save_pack)
 
 
 # ---------------------------------------------------------------- 核心（GUI/CLI 共用）
@@ -206,16 +205,35 @@ def run_gui() -> None:
             top.addStretch()
             lay.addLayout(top)
 
-            self.hint = QLabel("① 把寵物照片、影片（或整個資料夾）拖進這個視窗，或按下方按鈕加入。"
-                               "姿勢越多樣（坐、站、躺）越好；🎞 側面走路 3～5 秒的影片會變成真的會動腳的連續動畫。\n"
-                               "② 按「開始訓練」：AI 會自動去背、判斷姿勢。③ 檢查結果，右鍵可修正姿勢/面向/刪除。④ 按「儲存並召喚」。")
+            import spec
+
+            self.hint = QLabel("把照片、影片（或整個資料夾）拖進這個視窗 → 按「一鍵產出」，"
+                               "就會自動去背、判斷姿勢、補齊動作、放到桌面。準備越多，牠越像活的：<br>"
+                               + spec.SPEC_TEXT)
             self.hint.setWordWrap(True)
             lay.addWidget(self.hint)
+            self.spec_lbl = QLabel()
+            self.spec_lbl.setWordWrap(True)
+            self.spec_lbl.setStyleSheet("QLabel{background:palette(base);border:1px solid palette(mid);"
+                                        "border-radius:6px;padding:6px}")
+            lay.addWidget(self.spec_lbl)
+            opts = QHBoxLayout()
+            from common import load_settings
+
+            st = load_settings()
+            self.auto_ai = QCheckBox("缺的動作用 AI 補（預設免費 Hugging Face；按「🪄 AI 設定」可換 fal.ai）")
+            self.auto_ai.setChecked(st.get("auto_ai", True))
+            self.auto_launch = QCheckBox("完成後直接放到桌面")
+            self.auto_launch.setChecked(True)
+            opts.addWidget(self.auto_ai)
+            opts.addWidget(self.auto_launch)
+            opts.addStretch()
+            lay.addLayout(opts)
 
             btns = QHBoxLayout()
             b1 = QPushButton("加入照片…"); b1.clicked.connect(self.add_files)
             b2 = QPushButton("加入資料夾…"); b2.clicked.connect(self.add_folder)
-            self.go = QPushButton("開始訓練 ▶"); self.go.clicked.connect(self.start)
+            self.go = QPushButton("一鍵產出 ▶"); self.go.clicked.connect(self.start)
             bimp = QPushButton("匯入寵物包…"); bimp.clicked.connect(self.import_dialog)
             bexp = QPushButton("匯出這隻…"); bexp.clicked.connect(self.export_dialog)
             bimp.setToolTip("朋友分享的 .petpack 檔（也可以直接拖進視窗）")
@@ -245,7 +263,7 @@ def run_gui() -> None:
             self.count = QLabel("")
             bottom.addWidget(self.count)
             bottom.addStretch()
-            aib = QPushButton("🪄 AI 補齊動作…"); aib.clicked.connect(self.ai_fill)
+            aib = QPushButton("🪄 AI 設定／手動補…"); aib.clicked.connect(self.ai_fill)
             aib.setToolTip("沒拍到的動作（走路、坐下、趴下…）用 AI 從照片生成")
             bottom.addWidget(aib)
             save = QPushButton("儲存並召喚到桌面 🐾"); save.clicked.connect(self.save_and_launch)
@@ -344,7 +362,22 @@ def run_gui() -> None:
             if kind == "new" and obj.warning:
                 it.setToolTip(obj.warning)
 
+        def grid_entries(self):
+            out = []
+            for i in range(self.grid.count()):
+                kind, o = self.grid.item(i).data(Qt.UserRole)
+                if kind == "old":
+                    out.append({"pose": o["pose"], "kind": o.get("kind") or ("loop" if o.get("frames") else None),
+                                "to": o.get("to"), "animated": bool(o.get("frames"))})
+                else:
+                    out.append({"pose": o.pose, "kind": o.extra.get("kind"), "to": o.extra.get("to"),
+                                "animated": bool(o.frames)})
+            return out
+
         def update_count(self):
+            import spec
+
+            self.spec_lbl.setText(spec.html_table(spec.coverage(self.grid_entries())))
             c = {k: 0 for k in POSES}
             for i in range(self.grid.count()):
                 kind, o = self.grid.item(i).data(Qt.UserRole)
@@ -354,10 +387,13 @@ def run_gui() -> None:
 
         # ---- 訓練
         def start(self):
-            if not self.pending:
-                QMessageBox.information(self, "沒有照片", "先把寵物照片拖進來，或按「加入照片」。")
-                return
             if self.worker and self.worker.isRunning():
+                return
+            if not self.pending:
+                if self.grid.count():  # 沒有新素材：直接進下一步（補 AI、存檔、放桌面）
+                    self.on_done(0, 0)
+                    return
+                QMessageBox.information(self, "沒有素材", "先把寵物照片或影片拖進來，或按「加入照片」。")
                 return
             pack = load_pack(safe_name(self.name.currentText()))
             hashes = [int(im["hash"]) for im in pack["images"] if im.get("hash")]
@@ -387,9 +423,50 @@ def run_gui() -> None:
             self.update_count()
 
         def on_done(self, ok, bad):
+            """素材處理完 → 存檔 →（缺的用 AI 補）→ 放到桌面，一路做完。"""
+            from common import load_settings, save_settings
+
             self.go.setEnabled(True)
-            self.status.setText(f"完成：成功 {ok} 張" + (f"，略過 {bad} 張（重複或找不到主體）" if bad else "")
-                                + "。檢查一下，再按「儲存並召喚」。")
+            summary = (f"處理完成：成功 {ok} 個" + (f"，略過 {bad} 個（重複、太模糊或找不到寵物）" if bad else "")) if ok or bad else ""
+            st = load_settings()
+            st["auto_ai"] = self.auto_ai.isChecked()
+            save_settings(st)
+            name = self.save_only()
+            if not name:
+                return
+            if self.auto_ai.isChecked():
+                import aifill
+
+                jobs = aifill.missing_jobs(name)
+                if jobs:
+                    if st.get("ai_backend") == "fal" and st.get("fal_key"):
+                        backend = aifill.Fal(st["fal_key"])
+                    else:
+                        backend = aifill.HuggingFace(st.get("hf_token", ""), st.get("hf_space", ""))
+                    self.status.setText(summary + f"　接著用 AI 補 {len(jobs)} 段動作…")
+                    self.start_ai(name, jobs, backend)
+                    return
+            self.finish(name, summary)
+
+        def finish(self, name, summary=""):
+            import spec
+
+            lv = spec.level(spec.coverage(self.grid_entries()))
+            msg = f"{summary}　完成度：{spec.LEVELS[lv][0]}。"
+            if self.auto_launch.isChecked():
+                launch("pet", "--summon", name)
+                msg += f"{name} 已經放到你的桌面上了！"
+            else:
+                msg += "按「儲存並召喚」就能放到桌面。"
+            self.status.setText(msg + "（不滿意的可以右鍵刪除／修正，再按一次一鍵產出）")
+
+        def start_ai(self, name, jobs, backend):
+            self.worker = AIWorker(name, jobs, backend)
+            self.worker.progress.connect(self.on_progress)
+            self.worker.result.connect(self.on_result)
+            self.worker.finished_all.connect(self.on_ai_done)
+            self.go.setEnabled(False)
+            self.worker.start()
 
         # ---- 修正
         def menu(self, pos):
@@ -440,7 +517,7 @@ def run_gui() -> None:
             name = self.save_only()
             if not name:
                 return
-            subprocess.Popen([pythonw(), str(ROOT / "app" / "pet.py"), "--summon", name], cwd=str(ROOT))
+            launch("pet", "--summon", name)
             self.status.setText(f"已儲存，{name} 跑到你的桌面上了！"
                                 "（之後可以繼續餵新照片或影片，再按一次儲存就會更新）")
 
@@ -551,18 +628,14 @@ def run_gui() -> None:
                 backend = aifill.Fal(st["fal_key"])
             else:
                 backend = aifill.HuggingFace(st["hf_token"], st.get("hf_space", ""))
-            self.worker = AIWorker(name, chosen, backend)
-            self.worker.progress.connect(self.on_progress)
-            self.worker.result.connect(self.on_result)
-            self.worker.finished_all.connect(self.on_ai_done)
-            self.go.setEnabled(False)
-            self.worker.start()
+            self.start_ai(name, chosen, backend)
 
         def on_ai_done(self, ok, bad):
             self.go.setEnabled(True)
-            msg = f"AI 完成 {ok} 段" + (f"，失敗 {bad} 段" if bad else "")
-            self.status.setText(msg + "。檢查一下動作（不好的右鍵刪除），再按「儲存並召喚」。"
-                                + (f"\n{self.worker.last_error}" if self.worker.last_error else ""))
+            name = self.save_only()
+            msg = f"AI 補了 {ok} 段" + (f"，{bad} 段沒成功（{self.worker.last_error}）" if bad else "")
+            if name:
+                self.finish(name, msg)
 
     app = QApplication(sys.argv)
     w = Trainer()
