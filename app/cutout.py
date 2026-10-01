@@ -58,10 +58,19 @@ def _model_dir() -> Path:
     return d
 
 
+def _dl_callback(label, progress):
+    if not progress:
+        return None
+
+    def cb(done, total, speed):
+        pct = done * 100 / max(total, 1)
+        progress(f"下載{label}（只需一次）：{pct:4.1f}%　{done / 1e6:.0f}/{total / 1e6:.0f} MB　{speed / 1e6:.1f} MB/s")
+    return cb
+
+
 def get_detector(progress=None):
     global _detector
     if _detector is None:
-        import urllib.request
 
         import onnxruntime as ort
 
@@ -69,14 +78,11 @@ def get_detector(progress=None):
         if not f.exists() or f.stat().st_size < 30_000_000:
             if progress:
                 progress("下載動物偵測模型（約 36MB，只需一次）…")
-            try:
-                import fastdl
+            import fastdl
 
-                fastdl.download(DETECTOR_URL, f)
-            except Exception:
-                tmp = f.with_suffix(".part")
-                urllib.request.urlretrieve(DETECTOR_URL, tmp)
-                tmp.replace(f)
+            urls, _, md5 = fastdl.YOLOX
+            fastdl.download(urls, f, md5=md5, label="動物偵測模型", status=progress,
+                            callback=_dl_callback("動物偵測模型", progress))
         _detector = ort.InferenceSession(str(f), providers=["CPUExecutionProvider"])
     return _detector
 
@@ -124,15 +130,11 @@ def get_session(high_quality: bool = False, progress=None):
     # 模型放在專案的 models/ 底下，並用多線程下載（比 rembg 內建的單線程快很多）
     os.environ["U2NET_HOME"] = str(_model_dir() / "u2net")
     name = "birefnet-general" if high_quality else "isnet-general-use"
-    url, rel, md5 = fastdl.BIREFNET if high_quality else fastdl.MODELS[0]
+    urls, rel, md5 = fastdl.BIREFNET if high_quality else fastdl.ISNET
     target = _model_dir() / rel
     if not target.exists():
-        if progress:
-            progress(f"下載去背模型 {target.name}（只需一次）…")
-        try:
-            fastdl.download(url, target, md5=md5)
-        except Exception:
-            pass  # 交給 rembg 自己下載
+        fastdl.download(urls, target, md5=md5, label="去背模型", status=progress,
+                        callback=_dl_callback("去背模型", progress))
 
     from rembg import new_session
 

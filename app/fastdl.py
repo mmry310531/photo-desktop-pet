@@ -35,15 +35,20 @@ INDEXES = [
     "https://mirrors.cloud.tencent.com/pypi/simple",
 ]
 
-BIREFNET = ("https://github.com/danielgatis/rembg/releases/download/v0.0.0/BiRefNet-general-epoch_244.onnx",
+# 每個模型都有多個來源（GitHub + Hugging Face 鏡像），下載前先測速選最快的；
+# 卡住（一段時間沒進度）會自動換下一個來源。全部用雜湊值校驗，鏡像檔案被竄改也會被擋下。
+BIREFNET = (["https://github.com/danielgatis/rembg/releases/download/v0.0.0/BiRefNet-general-epoch_244.onnx"],
             "u2net/birefnet-general.onnx", "7a35a0141cbbc80de11d9c9a28f52697")
-MODELS = [
-    # (網址, 存放位置（相對 models/）, md5)
-    ("https://github.com/danielgatis/rembg/releases/download/v0.0.0/isnet-general-use.onnx",
-     "u2net/isnet-general-use.onnx", "fc16ebd8b0c10d971d3513d564d01e29"),
-    ("https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_s.onnx",
-     "yolox_s.onnx", None),
-]
+ISNET = (["https://huggingface.co/fofr/comfyui/resolve/main/rembg/isnet-general-use.onnx",
+          "https://github.com/danielgatis/rembg/releases/download/v0.0.0/isnet-general-use.onnx",
+          "https://hf-mirror.com/fofr/comfyui/resolve/main/rembg/isnet-general-use.onnx"],
+         "u2net/isnet-general-use.onnx", "fc16ebd8b0c10d971d3513d564d01e29")
+YOLOX = (["https://huggingface.co/skillsafe-ai/yolox-s/resolve/main/yolox_s.onnx",
+          "https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_s.onnx",
+          "https://hf-mirror.com/skillsafe-ai/yolox-s/resolve/main/yolox_s.onnx"],
+         "yolox_s.onnx", "162fa8fdc3979a395018701b60ff02fe")
+MODELS = [ISNET, YOLOX]
+STALL_SECS = 20  # 這麼久完全沒進度就換來源
 
 
 def _log(msg: str) -> None:
@@ -51,15 +56,23 @@ def _log(msg: str) -> None:
 
 
 class Progress:
-    def __init__(self, total: int, label: str):
+    def __init__(self, total: int, label: str, callback=None):
         self.total, self.label, self.done = total, label, 0
-        self.t0 = self.last = time.time()
+        self.t0 = self.last = self.last_gain = time.time()
         self.lock = threading.Lock()
+        self.callback = callback
+        self.abort = False
 
     def add(self, n: int) -> None:
         with self.lock:
             self.done += n
             now = time.time()
+            if n:
+                self.last_gain = now
+            if self.callback and (now - self.last > 0.3 or self.done >= self.total):
+                self.last = now
+                self.callback(self.done, self.total, self.done / max(now - self.t0, 0.01))
+                return
             if now - self.last > 0.5 or self.done >= self.total:
                 self.last = now
                 sp = self.done / max(now - self.t0, 0.01)
@@ -83,10 +96,14 @@ def _probe(url: str) -> tuple[str, int, bool]:
 def _get_range(url: str, start: int, end: int, f, lock, prog: Progress | None) -> None:
     pos = start
     for attempt in range(8):
+        if prog and prog.abort:
+            raise IOError("已放棄這個來源")
         try:
             req = urllib.request.Request(url, headers={**UA, "Range": f"bytes={pos}-{end}"})
-            with urllib.request.urlopen(req, timeout=30) as r:
+            with urllib.request.urlopen(req, timeout=15) as r:
                 while pos <= end:
+                    if prog and prog.abort:
+                        raise IOError("已放棄這個來源")
                     chunk = r.read(256 * 1024)
                     if not chunk:
                         break
@@ -99,23 +116,64 @@ def _get_range(url: str, start: int, end: int, f, lock, prog: Progress | None) -
             if pos > end:
                 return
         except Exception:
+            if prog and prog.abort:
+                raise
             time.sleep(1 + attempt)
     raise IOError(f"分段下載失敗：{url} bytes {start}-{end}")
 
 
-def download(url: str, dest: Path, segments: int = SEGMENTS, md5: str | None = None,
-             sha256: str | None = None, label: str | None = None) -> Path:
+def _quick_speed(url: str, secs: float = 3.0) -> float:
+    try:
+        final, size, ranged = _probe(url)
+        req = urllib.request.Request(final, headers={**UA, "Range": "bytes=0-4194303"})
+        t0, got = time.time(), 0
+        with urllib.request.urlopen(req, timeout=8) as r:
+            while time.time() - t0 < secs:
+                c = r.read(65536)
+                if not c:
+                    break
+                got += len(c)
+        return got / max(time.time() - t0, 0.05)
+    except Exception:
+        return 0.0
+
+
+def download(urls, dest: Path, segments: int = SEGMENTS, md5: str | None = None,
+             sha256: str | None = None, label: str | None = None, callback=None, status=None) -> Path:
+    """下載檔案。urls 可以是一個網址或多個鏡像；callback(已下載, 總大小, 速度) 用來回報進度。"""
+    urls = [urls] if isinstance(urls, str) else list(urls)
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     label = label or dest.name
     if dest.exists() and _verify(dest, md5, sha256):
         _log(f"  {label}：已下載過，略過")
         return dest
+    say = status or _log
+    if len(urls) > 1:
+        say(f"測試 {label} 各下載來源的速度…")
+        with ThreadPoolExecutor(len(urls)) as ex:
+            speeds = list(ex.map(_quick_speed, urls))
+        for u, sp in zip(urls, speeds):
+            _log(f"  {sp / 1e6:6.2f} MB/s  {u.split('/')[2]}")
+        urls = [u for _, u in sorted(zip(speeds, urls), key=lambda t: -t[0])]
+    last_err = None
+    for url in urls:
+        try:
+            say(f"下載 {label}（來源：{url.split('/')[2]}）…")
+            _download_one(url, dest, segments, md5, sha256, label, callback)
+            return dest
+        except Exception as e:
+            last_err = e
+            _log(f"\n  {url.split('/')[2]} 失敗：{e}，換下一個來源")
+    raise IOError(f"{label} 所有來源都下載失敗：{last_err}")
+
+
+def _download_one(url, dest, segments, md5, sha256, label, callback):
     final, size, ranged = _probe(url)
     tmp = dest.with_name(dest.name + ".part")
-    prog = Progress(size, label)
+    prog = Progress(size, label, callback)
     if not ranged or size < MIN_SEG:
-        with urllib.request.urlopen(urllib.request.Request(final, headers=UA), timeout=30) as r, open(tmp, "wb") as f:
+        with urllib.request.urlopen(urllib.request.Request(final, headers=UA), timeout=15) as r, open(tmp, "wb") as f:
             while True:
                 chunk = r.read(256 * 1024)
                 if not chunk:
@@ -128,16 +186,28 @@ def download(url: str, dest: Path, segments: int = SEGMENTS, md5: str | None = N
         with open(tmp, "wb") as f:
             f.truncate(size)
             lock = threading.Lock()
-            with ThreadPoolExecutor(n) as ex:
-                futs = [ex.submit(_get_range, final, a, b, f, lock, prog) for a, b in bounds]
+            ex = ThreadPoolExecutor(n)
+            futs = [ex.submit(_get_range, final, a, b, f, lock, prog) for a, b in bounds]
+            try:
+                # 看門狗：太久沒進度就放棄這個來源（不等卡住的連線，直接換）
+                while not all(fu.done() for fu in futs):
+                    time.sleep(0.5)
+                    prog.add(0)
+                    if time.time() - prog.last_gain > STALL_SECS:
+                        prog.abort = True
+                        raise IOError(f"{STALL_SECS} 秒沒有進度")
                 for fu in futs:
                     fu.result()
+            except BaseException:
+                prog.abort = True
+                ex.shutdown(wait=False, cancel_futures=True)
+                raise
+            ex.shutdown(wait=True)
     sys.stdout.write("\n")
     if not _verify(tmp, md5, sha256):
         tmp.unlink(missing_ok=True)
-        raise IOError(f"{label} 檔案校驗失敗（下載不完整），請重試")
+        raise IOError("檔案校驗失敗（下載不完整）")
     tmp.replace(dest)
-    return dest
 
 
 def _verify(p: Path, md5: str | None, sha256: str | None) -> bool:
@@ -252,9 +322,9 @@ def install(requirements: Path = ROOT / "requirements.txt") -> None:
 
 def models() -> None:
     _log("預先下載 AI 模型（之後訓練就不用等）…")
-    for url, rel, md5 in MODELS:
+    for urls, rel, md5 in MODELS:
         try:
-            download(url, ROOT / "models" / rel, md5=md5)
+            download(urls, ROOT / "models" / rel, md5=md5)
         except Exception as e:
             _log(f"  模型下載失敗（第一次訓練時會再試）：{e}")
 
