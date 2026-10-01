@@ -48,7 +48,7 @@ YOLOX = (["https://huggingface.co/skillsafe-ai/yolox-s/resolve/main/yolox_s.onnx
           "https://hf-mirror.com/skillsafe-ai/yolox-s/resolve/main/yolox_s.onnx"],
          "yolox_s.onnx", "162fa8fdc3979a395018701b60ff02fe")
 MODELS = [ISNET, YOLOX]
-STALL_SECS = 20  # 這麼久完全沒進度就換來源
+STALL_SECS = 60  # 這麼久完全沒進度就換來源（已下載的部分會保留）
 
 
 def _log(msg: str) -> None:
@@ -93,33 +93,49 @@ def _probe(url: str) -> tuple[str, int, bool]:
         return final, int(r.headers.get("Content-Length") or 0), False
 
 
-def _get_range(url: str, start: int, end: int, f, lock, prog: Progress | None) -> None:
-    pos = start
-    for attempt in range(8):
+def _read_some(r, n=64 * 1024):
+    """有多少讀多少（不等湊滿），慢速網路下進度才會持續更新、不會被誤判成卡住。"""
+    rd = getattr(r, "read1", None)
+    return rd(n) if rd else r.read(n)
+
+
+def _get_range(url: str, seg: list, f, lock, prog: Progress | None) -> None:
+    """下載一段。seg = [起點, 終點, 目前位置]，會即時更新目前位置，供續傳存檔。"""
+    for attempt in range(12):
+        if seg[2] > seg[1]:
+            return
         if prog and prog.abort:
             raise IOError("已放棄這個來源")
         try:
-            req = urllib.request.Request(url, headers={**UA, "Range": f"bytes={pos}-{end}"})
-            with urllib.request.urlopen(req, timeout=15) as r:
-                while pos <= end:
+            req = urllib.request.Request(url, headers={**UA, "Range": f"bytes={seg[2]}-{seg[1]}"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                while seg[2] <= seg[1]:
                     if prog and prog.abort:
                         raise IOError("已放棄這個來源")
-                    chunk = r.read(256 * 1024)
+                    chunk = _read_some(r)
                     if not chunk:
                         break
+                    chunk = chunk[: seg[1] - seg[2] + 1]
                     with lock:
-                        f.seek(pos)
+                        f.seek(seg[2])
                         f.write(chunk)
-                    pos += len(chunk)
+                    seg[2] += len(chunk)
                     if prog:
                         prog.add(len(chunk))
-            if pos > end:
+            if seg[2] > seg[1]:
                 return
         except Exception:
             if prog and prog.abort:
                 raise
-            time.sleep(1 + attempt)
-    raise IOError(f"分段下載失敗：{url} bytes {start}-{end}")
+            time.sleep(min(2 + attempt * 2, 15))
+    raise IOError(f"分段下載失敗：bytes {seg[0]}-{seg[1]}")
+
+
+def _known_copies(fname: str):
+    home = Path.home()
+    stem = fname.rsplit(".", 1)[0]
+    return [home / ".u2net" / fname, home / ".rembg" / "models" / stem / fname,
+            home / ".u2net" / "models" / stem / fname]
 
 
 def _quick_speed(url: str, secs: float = 3.0) -> float:
@@ -129,7 +145,7 @@ def _quick_speed(url: str, secs: float = 3.0) -> float:
         t0, got = time.time(), 0
         with urllib.request.urlopen(req, timeout=8) as r:
             while time.time() - t0 < secs:
-                c = r.read(65536)
+                c = _read_some(r)
                 if not c:
                     break
                 got += len(c)
@@ -148,6 +164,14 @@ def download(urls, dest: Path, segments: int = SEGMENTS, md5: str | None = None,
     if dest.exists() and _verify(dest, md5, sha256):
         _log(f"  {label}：已下載過，略過")
         return dest
+    # 舊版本或其他程式（rembg）已經下載過同一個檔案：直接複製，不用再下載
+    for cand in _known_copies(dest.name):
+        if cand.exists() and cand.stat().st_size > 0 and _verify(cand, md5, sha256):
+            import shutil
+
+            shutil.copyfile(cand, dest)
+            _log(f"  {label}：在 {cand.parent} 找到已下載的檔案，直接使用")
+            return dest
     say = status or _log
     if len(urls) > 1:
         say(f"測試 {label} 各下載來源的速度…")
@@ -169,30 +193,61 @@ def download(urls, dest: Path, segments: int = SEGMENTS, md5: str | None = None,
 
 
 def _download_one(url, dest, segments, md5, sha256, label, callback):
+    """多連線分段下載，支援續傳：.part 是下載中的檔案、.part.json 記錄每段下載到哪。
+    中斷、失敗、換來源、關掉程式再開，都會從上次的進度繼續，不會從 0 重來。"""
     final, size, ranged = _probe(url)
     tmp = dest.with_name(dest.name + ".part")
+    state_f = dest.with_name(dest.name + ".part.json")
     prog = Progress(size, label, callback)
     if not ranged or size < MIN_SEG:
-        with urllib.request.urlopen(urllib.request.Request(final, headers=UA), timeout=15) as r, open(tmp, "wb") as f:
+        with urllib.request.urlopen(urllib.request.Request(final, headers=UA), timeout=30) as r, open(tmp, "wb") as f:
             while True:
-                chunk = r.read(256 * 1024)
+                chunk = _read_some(r, 256 * 1024)
                 if not chunk:
                     break
                 f.write(chunk)
                 prog.add(len(chunk))
     else:
-        n = max(1, min(segments, size // MIN_SEG))
-        bounds = [(i * size // n, (i + 1) * size // n - 1) for i in range(n)]
-        with open(tmp, "wb") as f:
-            f.truncate(size)
-            lock = threading.Lock()
-            ex = ThreadPoolExecutor(n)
-            futs = [ex.submit(_get_range, final, a, b, f, lock, prog) for a, b in bounds]
+        segs = None
+        try:
+            st = json.loads(state_f.read_text(encoding="utf-8"))
+            if st.get("size") == size and st.get("md5") == md5 and tmp.exists() and tmp.stat().st_size == size:
+                segs = st["segs"]
+        except Exception:
+            pass
+        if segs is None:
+            n = max(1, min(segments, size // MIN_SEG))
+            segs = [[i * size // n, (i + 1) * size // n - 1, i * size // n] for i in range(n)]
+            with open(tmp, "wb") as f:
+                f.truncate(size)
+        else:
+            done = sum(sg[2] - sg[0] for sg in segs)
+            prog.done = done
+            prog.t0 = time.time()
+            _log(f"  {label}：接續上次進度 {done * 100 / size:.0f}%")
+
+        def save_state():
             try:
-                # 看門狗：太久沒進度就放棄這個來源（不等卡住的連線，直接換）
+                state_f.write_text(json.dumps({"size": size, "md5": md5, "segs": segs}), encoding="utf-8")
+            except OSError:
+                pass
+
+        with open(tmp, "r+b") as f:
+            lock = threading.Lock()
+            todo = [sg for sg in segs if sg[2] <= sg[1]]
+            ex = ThreadPoolExecutor(max(1, len(todo)))
+            futs = [ex.submit(_get_range, final, sg, f, lock, prog) for sg in todo]
+            last_save = time.time()
+            try:
+                # 看門狗：太久完全沒進度就換來源（已下載的部分保留）
                 while not all(fu.done() for fu in futs):
                     time.sleep(0.5)
                     prog.add(0)
+                    if time.time() - last_save > 2:
+                        with lock:
+                            f.flush()
+                        save_state()
+                        last_save = time.time()
                     if time.time() - prog.last_gain > STALL_SECS:
                         prog.abort = True
                         raise IOError(f"{STALL_SECS} 秒沒有進度")
@@ -201,12 +256,17 @@ def _download_one(url, dest, segments, md5, sha256, label, callback):
             except BaseException:
                 prog.abort = True
                 ex.shutdown(wait=False, cancel_futures=True)
+                with lock:
+                    f.flush()
+                save_state()
                 raise
             ex.shutdown(wait=True)
     sys.stdout.write("\n")
     if not _verify(tmp, md5, sha256):
         tmp.unlink(missing_ok=True)
-        raise IOError("檔案校驗失敗（下載不完整）")
+        state_f.unlink(missing_ok=True)
+        raise IOError("檔案校驗失敗（內容不對），已清除重來")
+    state_f.unlink(missing_ok=True)
     tmp.replace(dest)
 
 
@@ -249,7 +309,7 @@ def _speed(index: str, secs: float = 3.5) -> float:
             try:
                 with urllib.request.urlopen(req, timeout=5) as r:
                     while time.time() < stop:
-                        c = r.read(65536)
+                        c = _read_some(r)
                         if not c:
                             break
                         got[0] += len(c)

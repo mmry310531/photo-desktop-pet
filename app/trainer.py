@@ -121,7 +121,7 @@ def run_gui() -> None:
                 sess = get_session(self.hq, lambda m: self.progress.emit(0, len(self.files), m))
                 det = get_detector(lambda m: self.progress.emit(0, len(self.files), m))
             except Exception as e:
-                self.progress.emit(0, len(self.files), f"模型下載失敗，請檢查網路後再試：{e}")
+                self.progress.emit(0, len(self.files), f"模型下載中斷（已下載的部分會保留，再按一次會接著下載）：{e}")
                 self.finished_all.emit(0, len(self.files))
                 return
             ok = bad = 0
@@ -160,7 +160,7 @@ def run_gui() -> None:
                 sess = get_session(False, lambda m: self.progress.emit(0, n, m))
                 det = get_detector(lambda m: self.progress.emit(0, n, m))
             except Exception as e:
-                self.last_error = f"模型下載失敗：{e}"
+                self.last_error = f"模型下載中斷（已下載的部分會保留，再按一次會接著下載）：{e}"
                 self.finished_all.emit(0, n)
                 return
             for i, j in enumerate(self.jobs):
