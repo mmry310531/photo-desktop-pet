@@ -85,7 +85,7 @@
 
 | AI 來源 | 費用 | 適合 |
 |---|---|---|
-| **Hugging Face**（預設） | 免費：每個帳號每天有約 5 分鐘 GPU 額度（未登入 2 分鐘），大約可做 2～4 段，用完隔天重置 | 任何電腦，不需要顯示卡 |
+| **Hugging Face**（預設） | 免費，但額度很少：每段會先預扣約 3 分鐘 GPU 額度，未登入每天大約只夠 **1 段**，登入免費帳號約 **1～2 段**，用完隔天重置（實測） | 任何電腦，不需要顯示卡 |
 | **fal.ai** | 付費：480p 每秒 US$0.04，一段約 US$0.1，整套約 US$0.5 | 想一次做完、不想排隊 |
 
 - Hugging Face token：到 [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) 免費註冊、建立一個 **Read** 權限的 token 貼上

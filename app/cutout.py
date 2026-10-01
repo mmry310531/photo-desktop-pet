@@ -163,9 +163,18 @@ def get_session(high_quality: bool = False, progress=None):
 
 def collect_images(paths) -> list[Path]:
     out: list[Path] = []
+    from common import ROOT
+
+    def ours(q: Path) -> bool:  # 不要把程式自己的資料夾（寵物包、快取、模型）當成素材
+        try:
+            q.resolve().relative_to(ROOT)
+            return True
+        except ValueError:
+            return False
+
     for p in map(Path, paths):
         if p.is_dir():
-            out += sorted(q for q in p.rglob("*") if q.suffix.lower() in MEDIA_EXTS)
+            out += sorted(q for q in p.rglob("*") if q.suffix.lower() in MEDIA_EXTS and not ours(q))
         elif p.suffix.lower() in MEDIA_EXTS:
             out.append(p)
     seen, uniq = set(), []
@@ -411,17 +420,22 @@ VIDEO_W = 640
 
 
 def read_video_frames(path: Path, fps=VIDEO_FPS, max_secs=VIDEO_MAX_SECS):
-    """用 ffmpeg 取出影格（手機直拍影片會自動轉正）。"""
+    """用 ffmpeg 取出影格（手機直拍影片會自動轉正）。
+
+    注意：不能讓 ffmpeg 縮放，imageio_ffmpeg 是用原始尺寸切每一格的，縮放會讓畫面錯位。
+    """
     import imageio_ffmpeg
 
-    gen = imageio_ffmpeg.read_frames(
-        str(path), pix_fmt="rgb24",
-        output_params=["-vf", f"fps={fps},scale={VIDEO_W}:-2", "-t", str(max_secs)])
-    next(gen)  # 第一個是 metadata
+    gen = imageio_ffmpeg.read_frames(str(path), pix_fmt="rgb24",
+                                     output_params=["-vf", f"fps={fps}", "-t", str(max_secs)])
+    meta = next(gen)
+    w, h = meta["size"]
     frames = []
     for raw in gen:
-        h = len(raw) // (VIDEO_W * 3)
-        frames.append(Image.frombytes("RGB", (VIDEO_W, h), bytes(raw)))
+        im = Image.frombytes("RGB", (w, h), bytes(raw))
+        if im.width > VIDEO_W:
+            im = im.resize((VIDEO_W, round(im.height * VIDEO_W / im.width)), Image.LANCZOS)
+        frames.append(im)
     return frames
 
 

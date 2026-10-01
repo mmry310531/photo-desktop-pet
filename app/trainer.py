@@ -327,12 +327,12 @@ def run_gui() -> None:
                 self.status.setText(f"已匯出到 {f}（{Path(f).stat().st_size / 1e6:.1f} MB），傳給朋友，他用「匯入寵物包」就能直接用。")
 
         def add_files(self):
-            fs, _ = QFileDialog.getOpenFileNames(self, "選擇寵物照片或影片", "",
+            fs, _ = QFileDialog.getOpenFileNames(self, "選擇寵物照片或影片", str(Path.home() / "Pictures"),
                                                  "照片或影片 (*.jpg *.jpeg *.png *.webp *.heic *.heif *.bmp *.mp4 *.mov *.m4v *.avi *.mkv *.webm *.gif)")
             self.enqueue(fs)
 
         def add_folder(self):
-            d = QFileDialog.getExistingDirectory(self, "選擇照片資料夾")
+            d = QFileDialog.getExistingDirectory(self, "選擇照片資料夾", str(Path.home() / "Pictures"))
             if d:
                 self.enqueue([d])
 
@@ -631,7 +631,7 @@ def run_gui() -> None:
                 v.addWidget(c)
                 checks.append((c, j))
             v.addWidget(QLabel("<b>用哪個 AI？</b>"))
-            hf = QRadioButton("Hugging Face（免費，每天有額度，約可做 2～4 段；尖峰時段要排隊）")
+            hf = QRadioButton("Hugging Face（免費，但每天只夠做 1～2 段；用完隔天再繼續）")
             fal = QRadioButton("fal.ai（付費，最快最穩）")
             (fal if st.get("ai_backend") == "fal" else hf).setChecked(True)
             v.addWidget(hf)
