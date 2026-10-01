@@ -5,3 +5,4 @@ pillow-heif>=0.16
 numpy
 scipy
 imageio-ffmpeg>=0.5
+gradio_client>=1.0

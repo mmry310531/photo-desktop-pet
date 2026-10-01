@@ -30,6 +30,11 @@ def save_results(name: str, results, pack: dict) -> dict:
         used.add(fname)
         entry = {"file": fname, "pose": r.pose, "facing": r.facing,
                  "area": r.area, "hash": str(r.hash), "source": Path(r.source).name}
+        det = (r.extra.get("detected") or "").split(" ")[0]
+        if det:
+            from aifill import SPECIES
+
+            entry["species"] = SPECIES.get(det, "pet")
         if r.frames:  # 影片 -> 連續動畫：每一格各存一張
             stem = fname[:-4]
             entry["fps"] = r.fps
@@ -88,9 +93,9 @@ def run_gui() -> None:
     from PySide6.QtCore import QSize, Qt, QThread, Signal
     from PySide6.QtGui import QAction, QIcon, QImage, QPixmap
     from PySide6.QtWidgets import (
-        QApplication, QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QLabel, QListView,
-        QListWidget, QListWidgetItem, QMenu, QMessageBox, QProgressBar, QPushButton,
-        QVBoxLayout, QWidget,
+        QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QLabel,
+        QLineEdit, QListView, QListWidget, QListWidgetItem, QMenu, QMessageBox, QProgressBar, QPushButton,
+        QRadioButton, QVBoxLayout, QWidget,
     )
 
     def pil_to_icon(im) -> QIcon:
@@ -133,6 +138,47 @@ def run_gui() -> None:
                     bad += 1
                 self.result.emit(r)
             self.progress.emit(len(self.files), len(self.files), "完成")
+            self.finished_all.emit(ok, bad)
+
+    class AIWorker(QThread):
+        progress = Signal(int, int, str)
+        result = Signal(object)
+        finished_all = Signal(int, int)
+
+        def __init__(self, name, jobs, backend):
+            super().__init__()
+            self.name, self.jobs, self.backend = name, jobs, backend
+            self.last_error = ""
+
+        def run(self):
+            import aifill
+            from cutout import get_detector, get_session
+
+            n = len(self.jobs)
+            ok = bad = 0
+            try:
+                sess = get_session(False, lambda m: self.progress.emit(0, n, m))
+                det = get_detector(lambda m: self.progress.emit(0, n, m))
+            except Exception as e:
+                self.last_error = f"模型下載失敗：{e}"
+                self.finished_all.emit(0, n)
+                return
+            for i, j in enumerate(self.jobs):
+                say = (lambda m, i=i, j=j: self.progress.emit(i, n, f"[{i + 1}/{n}] {j.label}：{m}"))
+                try:
+                    r = aifill.run_job(self.name, j, self.backend, sess, det, say)
+                    if r.image is None:
+                        raise RuntimeError(r.error)
+                    ok += 1
+                    self.result.emit(r)
+                except Exception as e:
+                    bad += 1
+                    self.last_error = f"{j.label} 失敗：{e}"
+                    self.progress.emit(i, n, self.last_error)
+                    if "額度" in str(e):  # 免費額度用完，後面的也不用試了
+                        bad += n - i - 1
+                        break
+            self.progress.emit(n, n, "完成")
             self.finished_all.emit(ok, bad)
 
     class Trainer(QWidget):
@@ -194,6 +240,9 @@ def run_gui() -> None:
             self.count = QLabel("")
             bottom.addWidget(self.count)
             bottom.addStretch()
+            aib = QPushButton("🪄 AI 補齊動作…"); aib.clicked.connect(self.ai_fill)
+            aib.setToolTip("沒拍到的動作（走路、坐下、趴下…）用 AI 從照片生成")
+            bottom.addWidget(aib)
             save = QPushButton("儲存並召喚到桌面 🐾"); save.clicked.connect(self.save_and_launch)
             save.setMinimumHeight(36)
             bottom.addWidget(save)
@@ -351,6 +400,14 @@ def run_gui() -> None:
 
         # ---- 儲存
         def save_and_launch(self):
+            name = self.save_only()
+            if not name:
+                return
+            subprocess.Popen([pythonw(), str(ROOT / "app" / "pet.py"), "--summon", name], cwd=str(ROOT))
+            self.status.setText(f"已儲存，{name} 跑到你的桌面上了！"
+                                "（之後可以繼續餵新照片或影片，再按一次儲存就會更新）")
+
+        def save_only(self):
             name = safe_name(self.name.currentText())
             pack = load_pack(name)
             # 套用對舊圖的修改
@@ -375,11 +432,100 @@ def run_gui() -> None:
             self.results = []
             if not pack["images"]:
                 QMessageBox.warning(self, "還沒有照片", "這隻寵物還沒有任何姿勢，先餵幾張照片吧。")
-                return
+                return None
             self.load_existing(name)
-            subprocess.Popen([pythonw(), str(ROOT / "app" / "pet.py"), "--summon", name], cwd=str(ROOT))
-            self.status.setText(f"已儲存 {len(pack['images'])} 個姿勢，{name} 跑到你的桌面上了！"
-                                "（之後可以繼續餵新照片，再按一次儲存就會更新）")
+            return name
+
+        # ---- AI 補齊動作
+        def ai_fill(self):
+            import aifill
+            from common import load_settings, save_settings
+
+            if self.worker and self.worker.isRunning():
+                return
+            name = self.save_only()  # 先存檔，才知道還缺什麼
+            if not name:
+                return
+            jobs = aifill.missing_jobs(name)
+            if not jobs:
+                QMessageBox.information(self, "動作都齊了", "走路、坐、趴的循環動作和轉場都已經有了，不需要 AI 補。")
+                return
+            st = load_settings()
+            dlg = QDialog(self)
+            dlg.setWindowTitle("🪄 AI 補齊動作")
+            v = QVBoxLayout(dlg)
+            v.addWidget(QLabel("AI 會用你的照片當「開始畫面」和「結束畫面」，生成中間的自然動作。\n"
+                               "這隻寵物還缺這些（勾選要生成的）："))
+            checks = []
+            for j in jobs:
+                c = QCheckBox(j.label)
+                c.setChecked(True)
+                v.addWidget(c)
+                checks.append((c, j))
+            v.addWidget(QLabel("<b>用哪個 AI？</b>"))
+            hf = QRadioButton("Hugging Face（免費，每天有額度，約可做 2～4 段；尖峰時段要排隊）")
+            fal = QRadioButton("fal.ai（付費，最快最穩）")
+            (fal if st.get("ai_backend") == "fal" else hf).setChecked(True)
+            v.addWidget(hf)
+            hf_tok = QLineEdit(st.get("hf_token", ""))
+            hf_tok.setPlaceholderText("Hugging Face token（可留空；登入後的額度比較多）")
+            hf_tok.setEchoMode(QLineEdit.Password)
+            v.addWidget(hf_tok)
+            l1 = QLabel('<a href="https://huggingface.co/settings/tokens">免費註冊並取得 token（選 Read 權限即可）</a>')
+            l1.setOpenExternalLinks(True)
+            v.addWidget(l1)
+            v.addWidget(fal)
+            fal_key = QLineEdit(st.get("fal_key", ""))
+            fal_key.setPlaceholderText("fal.ai API key")
+            fal_key.setEchoMode(QLineEdit.Password)
+            v.addWidget(fal_key)
+            cost = QLabel()
+            l2 = QLabel('<a href="https://fal.ai/dashboard/keys">取得 fal.ai API key（需儲值）</a>')
+            l2.setOpenExternalLinks(True)
+            v.addWidget(l2)
+            v.addWidget(cost)
+
+            def upd():
+                n = sum(c.isChecked() for c, _ in checks)
+                cost.setText(f"預估費用：約 US${aifill.Fal.cost(n):.2f}（{n} 段 × {aifill.CLIP_SECS} 秒 × US${aifill.FAL_PRICE_PER_SEC}/秒）"
+                             if fal.isChecked() else f"共 {n} 段，免費（用你的 Hugging Face 每日額度）")
+            for c, _ in checks:
+                c.toggled.connect(upd)
+            fal.toggled.connect(upd)
+            upd()
+            v.addWidget(QLabel("<small>金鑰只存在你電腦的 settings.json，不會上傳到其他地方。"
+                               "AI 生成的動作偶爾會走樣，生成後一樣可以在這裡檢查、刪除。</small>"))
+            bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            bb.accepted.connect(dlg.accept)
+            bb.rejected.connect(dlg.reject)
+            v.addWidget(bb)
+            if dlg.exec() != QDialog.Accepted:
+                return
+            chosen = [j for c, j in checks if c.isChecked()]
+            if not chosen:
+                return
+            st["ai_backend"] = "fal" if fal.isChecked() else "hf"
+            st["hf_token"], st["fal_key"] = hf_tok.text().strip(), fal_key.text().strip()
+            save_settings(st)
+            if fal.isChecked():
+                if not st["fal_key"]:
+                    QMessageBox.warning(self, "缺少 API key", "請先填入 fal.ai 的 API key。")
+                    return
+                backend = aifill.Fal(st["fal_key"])
+            else:
+                backend = aifill.HuggingFace(st["hf_token"], st.get("hf_space", ""))
+            self.worker = AIWorker(name, chosen, backend)
+            self.worker.progress.connect(self.on_progress)
+            self.worker.result.connect(self.on_result)
+            self.worker.finished_all.connect(self.on_ai_done)
+            self.go.setEnabled(False)
+            self.worker.start()
+
+        def on_ai_done(self, ok, bad):
+            self.go.setEnabled(True)
+            msg = f"AI 完成 {ok} 段" + (f"，失敗 {bad} 段" if bad else "")
+            self.status.setText(msg + "。檢查一下動作（不好的右鍵刪除），再按「儲存並召喚」。"
+                                + (f"\n{self.worker.last_error}" if self.worker.last_error else ""))
 
     app = QApplication(sys.argv)
     w = Trainer()

@@ -64,6 +64,25 @@
 
 處理速度：一般電腦每格約 1～2 秒（每秒取 10 格，最多 6 秒），一段影片約 1～2 分鐘。
 
+## 🪄 沒拍到的動作，讓 AI 補
+
+訓練器下方按 **「🪄 AI 補齊動作…」**，程式會列出這隻寵物還缺哪些動作（走路循環、坐著待機、睡覺呼吸、坐下、趴下），
+用你的照片當「開始畫面」和「結束畫面」，讓影片 AI（Wan 2.2）生成中間的自然動作，再自動逐格去背做成動畫。
+
+| AI 來源 | 費用 | 適合 |
+|---|---|---|
+| **Hugging Face**（預設） | 免費：每個帳號每天有約 5 分鐘 GPU 額度（未登入 2 分鐘），大約可做 2～4 段，用完隔天重置 | 任何電腦，不需要顯示卡 |
+| **fal.ai** | 付費：480p 每秒 US$0.04，一段約 US$0.1，整套約 US$0.5 | 想一次做完、不想排隊 |
+
+- Hugging Face token：到 [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) 免費註冊、建立一個 **Read** 權限的 token 貼上
+- fal.ai key：到 [fal.ai/dashboard/keys](https://fal.ai/dashboard/keys) 建立（需先儲值）
+- 金鑰只存在你電腦的 `settings.json`
+- AI 生成的動作偶爾會走樣（長相改變、多一條腿…），生成完一樣會出現在訓練器裡讓你檢查、刪掉不好的
+- 免費來源使用的是 Hugging Face 上公開的 [Wan 2.2 首尾幀 Space](https://huggingface.co/spaces/multimodalart/wan-2-2-first-last-frame)；
+  若它哪天關閉，可以在 `settings.json` 加上 `"hf_space": "你複製的 Space 名稱"` 改用自己的副本
+
+**最自然的組合**：自己拍得到的動作用影片（真的是你家那隻），拍不到的（例如趴下的瞬間）再用 AI 補。
+
 ## 要餵幾張照片？
 
 **建議留下 10～20 張好照片，三種姿勢各 3～6 張。多樣性比數量重要。**
