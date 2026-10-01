@@ -12,7 +12,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from common import POSES, ROOT, list_packs, load_pack, pack_dir, pythonw, safe_name, save_pack  # noqa: E402
+from common import (POSES, PACK_EXT, ROOT, export_pack, import_pack, list_packs, load_pack,  # noqa: E402
+                    pack_dir, pythonw, safe_name, save_pack)
 
 
 # ---------------------------------------------------------------- 核心（GUI/CLI 共用）
@@ -215,8 +216,12 @@ def run_gui() -> None:
             b1 = QPushButton("加入照片…"); b1.clicked.connect(self.add_files)
             b2 = QPushButton("加入資料夾…"); b2.clicked.connect(self.add_folder)
             self.go = QPushButton("開始訓練 ▶"); self.go.clicked.connect(self.start)
+            bimp = QPushButton("匯入寵物包…"); bimp.clicked.connect(self.import_dialog)
+            bexp = QPushButton("匯出這隻…"); bexp.clicked.connect(self.export_dialog)
+            bimp.setToolTip("朋友分享的 .petpack 檔（也可以直接拖進視窗）")
+            bexp.setToolTip("存成 .petpack 檔，傳給朋友就能直接用，不用再訓練")
             self.pending_lbl = QLabel("待處理：0 張")
-            for b in (b1, b2, self.go):
+            for b in (b1, b2, self.go, bimp, bexp):
                 btns.addWidget(b)
             btns.addWidget(self.pending_lbl)
             btns.addStretch()
@@ -255,7 +260,39 @@ def run_gui() -> None:
                 e.acceptProposedAction()
 
         def dropEvent(self, e):
-            self.enqueue([u.toLocalFile() for u in e.mimeData().urls()])
+            paths = [u.toLocalFile() for u in e.mimeData().urls()]
+            packs = [p for p in paths if p.lower().endswith(PACK_EXT)]
+            for p in packs:
+                self.do_import(p)
+            self.enqueue([p for p in paths if p not in packs])
+
+        def import_dialog(self):
+            fs, _ = QFileDialog.getOpenFileNames(self, "選擇寵物包", "", f"寵物包 (*{PACK_EXT})")
+            for f in fs:
+                self.do_import(f)
+
+        def do_import(self, path):
+            try:
+                name = import_pack(path)
+            except Exception as e:
+                QMessageBox.warning(self, "匯入失敗", f"{Path(path).name}：{e}")
+                return
+            if self.name.findText(name) < 0:
+                self.name.addItem(name)
+            self.name.setCurrentText(name)
+            self.status.setText(f"已匯入「{name}」，按「儲存並召喚」就能放到桌面上。")
+
+        def export_dialog(self):
+            name = self.save_only()
+            if not name:
+                return
+            f, _ = QFileDialog.getSaveFileName(self, "匯出寵物包", str(Path.home() / f"{name}{PACK_EXT}"),
+                                               f"寵物包 (*{PACK_EXT})")
+            if f:
+                if not f.lower().endswith(PACK_EXT):
+                    f += PACK_EXT
+                export_pack(name, f)
+                self.status.setText(f"已匯出到 {f}（{Path(f).stat().st_size / 1e6:.1f} MB），傳給朋友，他用「匯入寵物包」就能直接用。")
 
         def add_files(self):
             fs, _ = QFileDialog.getOpenFileNames(self, "選擇寵物照片或影片", "",

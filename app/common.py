@@ -92,3 +92,61 @@ def pythonw() -> str:
         if w.exists():
             return str(w)
     return str(exe)
+
+
+# ---------------------------------------------------------------- 匯出／匯入寵物（.petpack = zip）
+PACK_EXT = ".petpack"
+
+
+def export_pack(name: str, dest) -> Path:
+    import zipfile
+
+    d = pack_dir(name)
+    data = load_pack(name)
+    files = {"pet.json"}
+    for im in data["images"]:
+        files.add(im["file"])
+        files.update(f["file"] for f in im.get("frames", []))
+    dest = Path(dest)
+    with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as z:
+        for f in sorted(files):
+            if (d / f).exists():
+                z.write(d / f, f)
+    return dest
+
+
+def import_pack(path) -> str:
+    """匯入 .petpack，回傳寵物名稱（同名會自動改名）。只接受 pet.json 和圖片，防止惡意壓縮檔。"""
+    import zipfile
+
+    with zipfile.ZipFile(path) as z:
+        names = z.namelist()
+        if "pet.json" not in names:
+            raise ValueError("這不是寵物包（找不到 pet.json）")
+        data = json.loads(z.read("pet.json").decode("utf-8"))
+        base = safe_name(data.get("name") or Path(path).stem)
+        name, k = base, 2
+        while pack_dir(name).exists():
+            name, k = f"{base} ({k})", k + 1
+        d = pack_dir(name)
+        d.mkdir(parents=True)
+        total = 0
+        for n in names:
+            if n == "pet.json":
+                continue
+            if "/" in n or "\\" in n or ".." in n or not n.lower().endswith(".png"):
+                continue  # 只收同一層的 png
+            info = z.getinfo(n)
+            total += info.file_size
+            if total > 500 * 1024 * 1024:
+                raise ValueError("寵物包太大（超過 500MB）")
+            (d / n).write_bytes(z.read(n))
+        def ok(fn):
+            return isinstance(fn, str) and "/" not in fn and "\\" not in fn and ".." not in fn
+        data["images"] = [im for im in data.get("images", []) if ok(im.get("file"))
+                          and all(ok(f.get("file")) for f in im.get("frames", []))]
+        data["name"] = name
+        save_pack(name, data)
+    if not load_pack(name)["images"]:
+        raise ValueError("寵物包裡沒有可用的圖片")
+    return name
