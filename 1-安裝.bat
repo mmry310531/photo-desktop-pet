@@ -32,9 +32,13 @@ if not exist ".venv\Scripts\python.exe" (
   echo 建立獨立環境 .venv ...
   %PY% -m venv .venv || (echo [失敗] 建立環境失敗 & pause & exit /b 1)
 )
-echo 安裝套件（約 300MB，視網速需要幾分鐘）...
-".venv\Scripts\python.exe" -m pip install --upgrade pip >nul
-".venv\Scripts\python.exe" -m pip install -r requirements.txt || (echo [失敗] 套件安裝失敗，請檢查網路後重試 & pause & exit /b 1)
+set "IDX=https://pypi.org/simple"
+for /f "delims=" %%i in ('".venv\Scripts\python.exe" app\pick_index.py') do set "IDX=%%i"
+echo 使用套件來源：%IDX%
+echo 安裝套件（約 250MB，視網速需要幾分鐘）...
+".venv\Scripts\python.exe" -m pip install -i %IDX% --upgrade pip >nul
+".venv\Scripts\python.exe" -m pip uninstall -y PySide6 PySide6-Addons >nul 2>&1
+".venv\Scripts\python.exe" -m pip install -i %IDX% --timeout 60 --retries 8 -r requirements.txt || (echo [失敗] 套件安裝失敗，請檢查網路後重試 & pause & exit /b 1)
 
 echo 在桌面建立捷徑 ...
 ".venv\Scripts\python.exe" app\make_shortcuts.py
