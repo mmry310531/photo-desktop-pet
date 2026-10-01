@@ -1,0 +1,6 @@
+PySide6>=6.6
+rembg[cpu]>=2.0.60
+pillow>=10
+pillow-heif>=0.16
+numpy
+scipy
