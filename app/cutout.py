@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageFilter, ImageOps
+from PIL import Image, ImageOps
 
 try:  # iPhone 的 HEIC 照片
     from pillow_heif import register_heif_opener
@@ -23,7 +23,7 @@ try:  # iPhone 的 HEIC 照片
 except Exception:
     pass
 
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic", ".heif", ".tif", ".tiff"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic", ".heif", ".tif", ".tiff", ".jfif", ".avif"}
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".3gp", ".gif"}
 MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS
 OUT_HEIGHT = 360  # 存檔高度（顯示時再依面積縮放）
@@ -129,16 +129,30 @@ def detect_pet(img: Image.Image, det) -> tuple[tuple[int, int, int, int], str, f
 
 
 def get_session(high_quality: bool = False, progress=None):
+    """載入去背模型。高品質模型（約 900MB）下載失敗時自動退回標準模型，不讓整批失敗。"""
     import fastdl
 
     # 模型放在專案的 models/ 底下，並用多線程下載（比 rembg 內建的單線程快很多）
     os.environ["U2NET_HOME"] = str(_model_dir() / "u2net")
-    name = "birefnet-general" if high_quality else "isnet-general-use"
-    urls, rel, md5 = fastdl.BIREFNET if high_quality else fastdl.ISNET
-    target = _model_dir() / rel
-    if not target.exists():
-        fastdl.download(urls, target, md5=md5, label="去背模型", status=progress,
-                        callback=_dl_callback("去背模型", progress))
+    if high_quality:
+        urls, rel, md5 = fastdl.BIREFNET
+        target = _model_dir() / rel
+        try:
+            if not target.exists():
+                fastdl.download(urls, target, md5=md5, label="高品質去背模型", status=progress,
+                                callback=_dl_callback("高品質去背模型（約 900MB）", progress))
+            name = "birefnet-general"
+        except Exception as e:
+            if progress:
+                progress(f"高品質模型下載失敗（{e}），改用標準模型繼續")
+            high_quality = False
+    if not high_quality:
+        urls, rel, md5 = fastdl.ISNET
+        target = _model_dir() / rel
+        if not target.exists():
+            fastdl.download(urls, target, md5=md5, label="去背模型", status=progress,
+                            callback=_dl_callback("去背模型", progress))
+        name = "isnet-general-use"
 
     from rembg import new_session
 
@@ -188,6 +202,71 @@ def _largest_component(alpha: np.ndarray) -> np.ndarray:
     # 半透明毛邊也留著：把保留區膨脹幾個像素當遮罩
     keep = ndimage.binary_dilation(keep, iterations=4)
     return np.where(keep, alpha, 0).astype(np.uint8)
+
+
+def clean_alpha(a: np.ndarray) -> np.ndarray:
+    """去掉半透明的「霧」（床單、毯子被半透明地留下來），補起身體中間的洞。"""
+    from scipy import ndimage
+
+    a = np.clip((a.astype(np.float32) - 90) / (210 - 90), 0, 1) * 255
+    solid = a > 128
+    lab, n = ndimage.label(solid)
+    if n > 1:
+        sizes = ndimage.sum(solid, lab, range(1, n + 1))
+        keep = np.isin(lab, [i + 1 for i, s in enumerate(sizes) if s >= sizes.max() * 0.15])
+        a = np.where(ndimage.binary_dilation(keep, iterations=3), a, 0)
+    filled = ndimage.binary_fill_holes(a > 128)
+    a = np.where(filled & (a < 128), 255, a)
+    return a.astype(np.uint8)
+
+
+# ---------------------------------------------------------------- 姿勢辨識（CLIP 零樣本分類）
+# 文字端的向量事先算好放在 clip_text.npy，使用者只需要下載圖片端模型（約 89MB）。
+CLIP_URLS = ["https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/main/onnx/vision_model_quantized.onnx",
+             "https://hf-mirror.com/Xenova/clip-vit-base-patch32/resolve/main/onnx/vision_model_quantized.onnx"]
+CLIP_MD5 = "f4f4e42828171ccd945ef40e183053c0"
+_clip = None
+
+
+def get_clip(progress=None):
+    global _clip
+    if _clip is None:
+        import json
+
+        import onnxruntime as ort
+
+        import fastdl
+
+        f = _model_dir() / "clip" / "vision_model_quantized.onnx"
+        if not f.exists():
+            fastdl.download(CLIP_URLS, f, md5=CLIP_MD5, label="姿勢辨識模型", status=progress,
+                            callback=_dl_callback("姿勢辨識模型（約 89MB）", progress))
+        here = Path(__file__).resolve().parent
+        _clip = (ort.InferenceSession(str(f), providers=["CPUExecutionProvider"]),
+                 np.load(here / "clip_text.npy"), json.load(open(here / "clip_labels.json", encoding="utf-8")))
+    return _clip
+
+
+def clip_pose(img: Image.Image) -> dict | None:
+    if _clip is None:
+        return None
+    sess, T, labels = _clip
+    w, h = img.size
+    s = max(w, h)
+    bg = Image.new("RGB", (s, s), (124, 116, 104))
+    bg.paste(img.convert("RGB"), ((s - w) // 2, (s - h) // 2))
+    x = np.asarray(bg.resize((224, 224), Image.BICUBIC), dtype=np.float32) / 255
+    x = (x - [0.4815, 0.4578, 0.4082]) / [0.2686, 0.2613, 0.2758]
+    e = sess.run(None, {sess.get_inputs()[0].name: x.transpose(2, 0, 1)[None].astype(np.float32)})[0][0]
+    e = e / np.linalg.norm(e)
+    sims = T @ e * 100
+    p = np.exp(sims - sims.max())
+    p /= p.sum()
+    out = {}
+    for k in set(labels):  # 每類的機率加總（用北鼻 61 張實拍照片對照過，加總比平均準）
+        idx = [i for i, l in enumerate(labels) if l == k]
+        out[k] = float(p[idx].sum())
+    return out
 
 
 def classify(alpha: np.ndarray) -> tuple[str, str, dict]:
@@ -261,6 +340,8 @@ def process(path: Path, session, existing_hashes: list[int] | None = None, detec
             r.error = "找不到明顯的主體（寵物太小或背景太亂）"
             return r
 
+        raw = a.copy()
+        a = clean_alpha(a)
         ys, xs = np.where(a > 24)
         y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
         H, W = a.shape
@@ -270,16 +351,33 @@ def process(path: Path, session, existing_hashes: list[int] | None = None, detec
         if edges >= 2:
             r.warning = "寵物可能被照片邊緣切到"
 
+        # 品質分數：偵測信心、半透明殘留（背景沒去乾淨）、被切到、形狀是否合理
+        solid = a > 128
+        haze = float(((raw > 30) & (raw < 220)).sum() / max(solid.sum(), 1))
+        conf = found[2] if found else 0.4
+        fill = float(solid.sum() / max((bx1 - bx0) * (by1 - by0), 1)) if found else 0.5
+        score = conf - 1.5 * haze - 0.25 * edges - 0.5 * abs(fill - 0.55)
+        r.extra.update({"score": round(score, 2), "haze": round(haze, 2)})
+
+        # 姿勢：先用 AI（CLIP）看內容判斷，沒有模型時才退回用形狀猜
+        probs = clip_pose(img)
+        if probs:
+            r.extra["clip"] = {k: round(v, 2) for k, v in probs.items()}
+            if probs.get("face", 0) > 0.35:
+                r.error = "太近的特寫，看不到身體（請用拍到全身的照片）"
+                return r
+        if score < 0:
+            r.error = f"品質太差，自動略過（背景沒去乾淨或被切到，分數 {score:.2f}）"
+            return r
+
         rgba = np.dstack([np.asarray(cut)[:, :, :3], a])[y0:y1, x0:x1]
         out = Image.fromarray(rgba, "RGBA")
-        # 輕微柔化邊緣避免鋸齒
-        alpha = out.getchannel("A").filter(ImageFilter.GaussianBlur(0.6))
-        out.putalpha(alpha)
-
         scale = OUT_HEIGHT / out.height
         out = out.resize((max(1, round(out.width * scale)), OUT_HEIGHT), Image.LANCZOS)
         al = np.asarray(out.getchannel("A"))
         r.pose, r.facing, info = classify(al)
+        if probs:
+            r.pose = max(("walk", "sit", "lie"), key=lambda k: probs.get(k, 0))
         r.extra.update(info)
         r.area = int((al > 128).sum())
         r.image = out

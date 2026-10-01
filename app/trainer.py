@@ -71,6 +71,12 @@ def run_cli(argv: list[str]) -> None:
     print(f"找到 {len(files)} 個照片／影片，載入 AI 模型…")
     sess = get_session(hq)
     det = get_detector(print)
+    try:
+        from cutout import get_clip
+
+        get_clip(print)
+    except Exception as e:
+        print("姿勢辨識模型無法使用，改用形狀判斷：", e)
     hashes = [int(im["hash"]) for im in pack["images"] if im.get("hash")]
     good = []
     for i, f in enumerate(files, 1):
@@ -112,6 +118,7 @@ def run_gui() -> None:
             super().__init__()
             self.files, self.hq, self.hashes = files, hq, list(hashes)
             self.stop = False
+            self.fatal = ""
 
         def run(self):
             from cutout import get_detector, get_session, process_any
@@ -121,9 +128,16 @@ def run_gui() -> None:
                 sess = get_session(self.hq, lambda m: self.progress.emit(0, len(self.files), m))
                 det = get_detector(lambda m: self.progress.emit(0, len(self.files), m))
             except Exception as e:
-                self.progress.emit(0, len(self.files), f"模型下載中斷（已下載的部分會保留，再按一次會接著下載）：{e}")
-                self.finished_all.emit(0, len(self.files))
+                self.fatal = f"AI 模型還沒下載好，照片都還沒處理（已下載的部分會保留，再按一次會接著下載）：{e}"
+                self.progress.emit(0, len(self.files), self.fatal)
+                self.finished_all.emit(0, 0)
                 return
+            try:  # 姿勢辨識模型是加分項，下載失敗就用形狀判斷，不影響其他功能
+                from cutout import get_clip
+
+                get_clip(lambda m: self.progress.emit(0, len(self.files), m))
+            except Exception:
+                pass
             ok = bad = 0
             for i, f in enumerate(self.files, 1):
                 if self.stop:
@@ -200,7 +214,7 @@ def run_gui() -> None:
             self.name.setMinimumWidth(200)
             self.name.currentTextChanged.connect(self.load_existing)
             top.addWidget(self.name)
-            self.hq = QCheckBox("高品質毛邊（較慢，模型約 900MB）")
+            self.hq = QCheckBox("高品質毛邊（要另外下載約 900MB 的模型，處理也慢很多；一般不需要）")
             top.addWidget(self.hq)
             top.addStretch()
             lay.addLayout(top)
@@ -326,9 +340,20 @@ def run_gui() -> None:
             from cutout import collect_images
 
             new = collect_images(paths)
+            if paths and not new:
+                QMessageBox.information(
+                    self, "沒有找到照片或影片",
+                    "選的位置裡沒有支援的檔案。\n支援：JPG、PNG、HEIC、WEBP、AVIF、JFIF、MP4、MOV 等。\n"
+                    "（OneDrive／iCloud 只在雲端的檔案請先下載到電腦）")
+                return
             have = {str(p) for p in self.pending}
-            self.pending += [p for p in new if str(p) not in have]
-            self.pending_lbl.setText(f"待處理：{len(self.pending)} 張")
+            add = [p for p in new if str(p) not in have]
+            self.pending += add
+            self.pending_lbl.setText(f"待處理：{len(self.pending)} 個")
+            if add:
+                self.status.setText(f"加入 {len(add)} 個照片／影片，自動開始處理…")
+                if not (self.worker and self.worker.isRunning()):
+                    self.process_pending(finish=False)
 
         # ---- 既有寵物包
         def load_existing(self, name):
@@ -387,25 +412,54 @@ def run_gui() -> None:
 
         # ---- 訓練
         def start(self):
+            """一鍵產出：處理還沒處理的素材 → 存檔 → AI 補 → 放到桌面。"""
             if self.worker and self.worker.isRunning():
+                self.finish_after = True
+                self.status.setText("素材還在處理中，處理完會自動接著產出…")
                 return
-            if not self.pending:
-                if self.grid.count():  # 沒有新素材：直接進下一步（補 AI、存檔、放桌面）
-                    self.on_done(0, 0)
-                    return
-                QMessageBox.information(self, "沒有素材", "先把寵物照片或影片拖進來，或按「加入照片」。")
+            if self.pending:
+                self.process_pending(finish=True)
                 return
+            if self.grid.count():  # 沒有新素材：直接進下一步（補 AI、存檔、放桌面）
+                self.on_done(0, 0)
+                return
+            QMessageBox.information(self, "沒有素材", "先把寵物照片或影片拖進來，或按「加入照片」。")
+
+        def process_pending(self, finish):
+            """加入素材後自動開始去背、判斷姿勢；finish=True 時處理完接著一鍵產出。"""
+            self.finish_after = finish
+            self.batch_ok = getattr(self, "batch_ok", 0)
+            self.batch_bad = getattr(self, "batch_bad", 0)
             pack = load_pack(safe_name(self.name.currentText()))
             hashes = [int(im["hash"]) for im in pack["images"] if im.get("hash")]
             hashes += [r.hash for r in self.results]
             self.worker = Worker(self.pending, self.hq.isChecked(), hashes)
             self.pending = []
-            self.pending_lbl.setText("待處理：0 張")
+            self.pending_lbl.setText("待處理：0 個")
             self.worker.progress.connect(self.on_progress)
             self.worker.result.connect(self.on_result)
-            self.worker.finished_all.connect(self.on_done)
-            self.go.setEnabled(False)
+            self.worker.finished_all.connect(self.on_batch_done)
             self.worker.start()
+
+        def on_batch_done(self, ok, bad):
+            if self.worker.fatal:  # 模型沒載入：素材放回待處理，不要假裝處理過
+                self.pending = list(self.worker.files) + self.pending
+                self.pending_lbl.setText(f"待處理：{len(self.pending)} 個")
+                self.batch_ok = self.batch_bad = 0
+                self.status.setText(self.worker.fatal)
+                return
+            self.batch_ok += ok
+            self.batch_bad += bad
+            if self.pending:  # 處理中又加了新的
+                self.process_pending(self.finish_after)
+                return
+            ok, bad = self.batch_ok, self.batch_bad
+            self.batch_ok = self.batch_bad = 0
+            if self.finish_after:
+                self.on_done(ok, bad)
+            else:
+                self.status.setText(f"處理好 {ok} 個" + (f"，略過 {bad} 個（重複、太模糊或找不到寵物）" if bad else "")
+                                    + "。可以繼續加素材，或按「一鍵產出 ▶」完成並放到桌面。")
 
         def on_progress(self, i, n, msg):
             self.bar.setMaximum(max(n, 1)); self.bar.setValue(i); self.status.setText(msg)
