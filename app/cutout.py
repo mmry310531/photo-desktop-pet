@@ -214,19 +214,41 @@ def _largest_component(alpha: np.ndarray) -> np.ndarray:
 
 
 def clean_alpha(a: np.ndarray) -> np.ndarray:
-    """去掉半透明的「霧」（床單、毯子被半透明地留下來），補起身體中間的洞。"""
+    """整理去背的透明度：
+    1. 身體附近用低門檻（深色毛、白色毛邊模型常常只給一半把握，不能丟）
+       離身體遠的地方用高門檻（去掉床單、毯子被半透明留下來的「霧」）
+    2. 只留主體（和夠大的部分）
+    3. 補洞，並補回輪廓上凹進去、模型有一點把握的缺口（黑毛貼著深色背景時常被吃掉一塊）
+    """
     from scipy import ndimage
 
-    a = np.clip((a.astype(np.float32) - 90) / (210 - 90), 0, 1) * 255
-    solid = a > 128
+    raw = a.astype(np.float32)
+    core = raw > 200
+    lab, n = ndimage.label(core)
+    if n > 1:
+        sz = ndimage.sum(core, lab, range(1, n + 1))
+        core = np.isin(lab, [i + 1 for i, s in enumerate(sz) if s >= sz.max() * 0.1])
+    H, W = raw.shape
+    r = max(3, int(0.035 * max(H, W)))
+    near = ndimage.binary_dilation(core, iterations=r) if core.any() else np.zeros_like(core)
+    lo = np.clip((raw - 35) / (150 - 35), 0, 1)
+    hi = np.clip((raw - 110) / (220 - 110), 0, 1)
+    out = np.where(near, lo, hi) * 255
+    solid = out > 128
     lab, n = ndimage.label(solid)
     if n > 1:
-        sizes = ndimage.sum(solid, lab, range(1, n + 1))
-        keep = np.isin(lab, [i + 1 for i, s in enumerate(sizes) if s >= sizes.max() * 0.15])
-        a = np.where(ndimage.binary_dilation(keep, iterations=3), a, 0)
-    filled = ndimage.binary_fill_holes(a > 128)
-    a = np.where(filled & (a < 128), 255, a)
-    return a.astype(np.uint8)
+        sz = ndimage.sum(solid, lab, range(1, n + 1))
+        keep = np.isin(lab, [i + 1 for i, s in enumerate(sz) if s >= sz.max() * 0.15])
+        out = np.where(ndimage.binary_dilation(keep, iterations=3), out, 0)
+    filled = ndimage.binary_fill_holes(out > 128)
+    out = np.where(filled & (out < 128), 255, out)
+    # 輪廓缺口
+    solid = out > 128
+    rr = max(4, int(0.04 * max(H, W)))
+    closed = ndimage.binary_closing(np.pad(solid, rr), structure=np.ones((3, 3)), iterations=rr)[rr:-rr, rr:-rr]
+    add = closed & ~solid & (raw > 8)
+    out[add] = 255
+    return out.astype(np.uint8)
 
 
 # ---------------------------------------------------------------- 姿勢辨識（CLIP 零樣本分類）
