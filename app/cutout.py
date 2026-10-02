@@ -629,6 +629,8 @@ def _cut_frame(img, session, detector, last_box):
         return None
     if _refine_video:
         a, _ = matte(crop, a, (bx0 - cx0, by0 - cy0, bx1 - cx0, by1 - cy0))
+    else:
+        a = clean_alpha(a)  # 去掉背景殘留的半透明「霧」、補回黑毛
     rgba = np.dstack([np.asarray(cut)[:, :, :3], a])
     return a, box, rgba
 
@@ -659,7 +661,7 @@ def _pose_of(frames_alpha):
 
 
 def process_video(path: Path, session, detector, progress=None, force: dict | None = None,
-                  max_secs=VIDEO_MAX_SECS) -> CutResult:
+                  max_secs=VIDEO_MAX_SECS, frames: list | None = None) -> CutResult:
     """把一段寵物影片變成連續動畫。
 
     自動判斷是「循環動作」（走路、坐著搖尾巴、睡覺呼吸）還是「轉場動作」（坐下、趴下、起身）：
@@ -667,7 +669,8 @@ def process_video(path: Path, session, detector, progress=None, force: dict | No
     """
     r = CutResult(source=str(path))
     try:
-        frames = read_video_frames(path, max_secs=max_secs)
+        if frames is None:
+            frames = read_video_frames(path, max_secs=max_secs)
         if len(frames) < 4:
             r.error = "影片太短"
             return r
@@ -698,6 +701,15 @@ def process_video(path: Path, session, detector, progress=None, force: dict | No
         for i in range(len(tight)):
             nb = areas[max(0, i - 3):i + 4]
             keep[i] = abs(areas[i] - np.median(nb)) < np.median(nb) * 0.4
+        # 形狀跟前後兩格都差很多的（去背突然失敗、被手擋住）也去掉，不然播放時會閃一下
+        shapes = [np.asarray(Image.fromarray(((t[:, :, 3] > 128) * 255).astype(np.uint8)).resize((32, 32))) > 127
+                  for t in tight]
+
+        def iou(p, q):
+            return np.logical_and(p, q).sum() / max(np.logical_or(p, q).sum(), 1)
+        for i in range(1, len(tight) - 1):
+            if keep[i] and iou(shapes[i], shapes[i - 1]) < 0.55 and iou(shapes[i], shapes[i + 1]) < 0.55:
+                keep[i] = False
         tight = [t for t, k in zip(tight, keep) if k]
         boxes = [bx for bx, k in zip(boxes, keep) if k]
         if len(tight) < 4:
@@ -766,7 +778,127 @@ def process_video(path: Path, session, detector, progress=None, force: dict | No
     return r
 
 
-def process_any(path: Path, session, hashes, detector, progress=None) -> CutResult:
+# ---------------------------------------------------------------- 從手機影片裡挑出能用的片段
+# 一般人拍的影片是手拿、鏡頭跟著貓移動、貓一下走近一下走遠，常常一段影片裡有好幾個動作。
+# 所以不再只取前 6 秒當一整段，而是先快速掃過整段影片（只做偵測＋姿勢判斷，很快），
+# 找出「姿勢穩定、大小穩定、全身都在畫面裡」的片段，再只對那幾段去背：
+#   - 同一個姿勢持續 1.5 秒以上 → 循環動作（坐著待機、趴著、走路）
+#   - 姿勢從 A 換成 B（例如趴著 → 起身走路）→ 轉場動作
+SCAN_MAX_SECS = 30
+LOOP_MIN, LOOP_MAX, TRANS_PAD = 15, 40, 8   # 以格數計（每秒 10 格）
+MAX_CLIPS_PER_VIDEO = 4
+
+
+def _frame_pose(probs: dict | None, box) -> str:
+    """影片單格的姿勢。CLIP 分辨「趴／躺」很準，但常把坐著看成站著；坐和站改用外框比例判斷。"""
+    w, h = box[2] - box[0], box[3] - box[1]
+    if probs and probs.get("lie", 0) > max(probs.get("walk", 0), probs.get("sit", 0)) + 0.05:
+        return "lie"
+    if probs is None and w / max(h, 1) > 2.1:
+        return "lie"
+    return "sit" if w / max(h, 1) < 1.3 else "walk"
+
+
+def scan_video(frames, detector, progress=None, name=""):
+    """快速掃描：每格的框、姿勢、能不能用。"""
+    info = []
+    for i, im in enumerate(frames):
+        if progress and i % 10 == 0:
+            progress(f"掃描影片 {name}：{i}/{len(frames)} 格")
+        d = detect_pet(im, detector) if detector is not None else None
+        if not d:
+            info.append(None)
+            continue
+        (x0, y0, x1, y1), _, conf = d
+        mx, my = (x1 - x0) * 0.1, (y1 - y0) * 0.1
+        crop = im.crop((max(0, x0 - mx), max(0, y0 - my), min(im.width, x1 + mx), min(im.height, y1 + my)))
+        probs = clip_pose(crop)
+        edge = x0 <= 2 or y0 <= 2 or x1 >= im.width - 2 or y1 >= im.height - 2
+        info.append({"box": (x0, y0, x1, y1), "h": y1 - y0, "pose": _frame_pose(probs, (x0, y0, x1, y1)),
+                     "ok": conf > 0.4 and not edge and (y1 - y0) > im.height * 0.12})
+    # 姿勢做時間上的平滑（前後 7 格多數決），避免一兩格判錯就切斷
+    raw = [x["pose"] if x else None for x in info]
+    for i, x in enumerate(info):
+        if x:
+            win = [p for p in raw[max(0, i - 3):i + 4] if p]
+            x["pose"] = max(set(win), key=win.count)
+    return info
+
+
+def find_segments(info) -> list[dict]:
+    """把掃描結果切成「姿勢相同、大小穩定、連續可用」的段落。"""
+    segs, cur = [], None
+    for i, x in enumerate(info):
+        good = x is not None and x["ok"]
+        if good and cur and x["pose"] == cur["pose"] and abs(np.log(x["h"] / np.median(cur["hs"]))) < 0.22:
+            cur["end"] = i + 1
+            cur["hs"].append(x["h"])
+            continue
+        if cur:
+            segs.append(cur)
+        cur = {"pose": x["pose"], "start": i, "end": i + 1, "hs": [x["h"]]} if good else None
+    if cur:
+        segs.append(cur)
+    return segs
+
+
+def plan_clips(info) -> list[dict]:
+    """挑出要做成動畫的片段：每種姿勢最長的循環段，加上姿勢之間的轉場。"""
+    segs = find_segments(info)
+    clips = []
+    for a, b in zip(segs, segs[1:]):  # 轉場：A 段結尾 → B 段開頭，中間空檔不能太長、大小要接得上
+        gap = b["start"] - a["end"]
+        if (a["pose"] != b["pose"] and gap <= 10 and a["end"] - a["start"] >= 5 and b["end"] - b["start"] >= 5
+                and abs(np.log(np.median(b["hs"][:5]) / np.median(a["hs"][-5:]))) < 0.35):
+            clips.append({"kind": "trans", "from": a["pose"], "to": b["pose"],
+                          "start": max(a["start"], a["end"] - TRANS_PAD), "end": min(b["end"], b["start"] + TRANS_PAD),
+                          "score": 100})
+    best = {}
+    for sgm in segs:
+        n = sgm["end"] - sgm["start"]
+        if n >= LOOP_MIN and n > best.get(sgm["pose"], {}).get("n", 0):
+            best[sgm["pose"]] = {"kind": "loop", "from": sgm["pose"], "to": sgm["pose"], "start": sgm["start"],
+                                 "end": sgm["end"], "n": n, "score": n}
+    clips += best.values()
+    clips.sort(key=lambda c: -c["score"])
+    chosen = []
+    for c in clips:  # 不重疊（轉場可以和循環段的頭尾共用幾格）
+        if all(c["end"] <= o["start"] + 4 or c["start"] >= o["end"] - 4 for o in chosen):
+            chosen.append(c)
+        if len(chosen) >= MAX_CLIPS_PER_VIDEO:
+            break
+    return sorted(chosen, key=lambda c: c["start"])
+
+
+def process_video_clips(path: Path, session, detector, progress=None) -> list[CutResult]:
+    """一段手機影片 → 0～4 個動畫片段（循環或轉場）。"""
+    name = Path(path).name
+    try:
+        frames = read_video_frames(path, max_secs=SCAN_MAX_SECS)
+    except Exception as e:
+        return [CutResult(source=str(path), error=f"讀不到影片：{type(e).__name__}: {e}")]
+    if len(frames) < 4:
+        return [CutResult(source=str(path), error="影片太短")]
+    info = scan_video(frames, detector, progress, name)
+    plans = plan_clips(info)
+    if not plans:
+        return [CutResult(source=str(path), error="影片裡找不到姿勢穩定、全身入鏡的片段（鏡頭盡量固定、拍到全身）")]
+    out = []
+    for k, c in enumerate(plans, 1):
+        sub = frames[c["start"]:c["end"]]
+        if c["kind"] == "loop" and len(sub) > LOOP_MAX:
+            sub = sub[:LOOP_MAX + 10]  # 循環段太長只取前面一段，_best_loop 會在裡面找頭尾最接的
+        r = process_video(path, session, detector,
+                          (lambda m, k=k: progress(f"{m}（片段 {k}/{len(plans)}）")) if progress else None,
+                          force={"kind": c["kind"], "from": c["from"], "to": c["to"]}, frames=sub)
+        r.source = f"{path}#{c['start'] / VIDEO_FPS:.1f}-{c['end'] / VIDEO_FPS:.1f}s"
+        r.extra["segment"] = [round(c["start"] / VIDEO_FPS, 1), round(c["end"] / VIDEO_FPS, 1)]
+        out.append(r)
+    return out
+
+
+def process_any(path: Path, session, hashes, detector, progress=None) -> list[CutResult]:
+    """照片 → 1 個結果；影片 → 可能好幾個片段。"""
     if Path(path).suffix.lower() in VIDEO_EXTS:
-        return process_video(path, session, detector, progress)
-    return process(path, session, hashes, detector)
+        return process_video_clips(path, session, detector, progress)
+    return [process(path, session, hashes, detector)]

@@ -83,16 +83,18 @@ def run_cli(argv: list[str]) -> None:
     hashes = [int(im["hash"]) for im in pack["images"] if im.get("hash")]
     good = []
     for i, f in enumerate(files, 1):
-        r = process_any(f, sess, hashes, det, lambda m: print("  " + m, end="\r"))
-        clip = ""
-        if r.frames:
-            k = r.extra.get("kind")
-            clip = f"🎞 {len(r.frames)} 格{'轉場→' + POSES[r.extra['to']] if k == 'trans' else '循環'} "
-        tag = r.error or f"{clip}{r.extra.get('detected', '')} {POSES[r.pose]}，面向{'左' if r.facing == 'left' else '右'} {r.warning}"
-        print(f"[{i}/{len(files)}] {f.name}: {tag}")
-        if r.image is not None:
-            good.append(r)
-            hashes.append(r.hash)
+        for r in process_any(f, sess, hashes, det, lambda m: print("  " + m, end="\r")):
+            clip = ""
+            if r.frames:
+                k = r.extra.get("kind")
+                seg = r.extra.get("segment")
+                clip = (f"🎞 {seg[0]}～{seg[1]} 秒 " if seg else "🎞 ") + \
+                    f"{len(r.frames)} 格{'轉場→' + POSES[r.extra['to']] if k == 'trans' else '循環'} "
+            tag = r.error or f"{clip}{r.extra.get('detected', '')} {POSES[r.pose]}，面向{'左' if r.facing == 'left' else '右'} {r.warning}"
+            print(f"[{i}/{len(files)}] {f.name}: {tag}")
+            if r.image is not None:
+                good.append(r)
+                hashes.append(r.hash)
     pack = save_results(name, good, pack)
     print(f"完成！{name} 現在有 {len(pack['images'])} 個姿勢，存在 {pack_dir(name)}")
 
@@ -146,14 +148,14 @@ def run_gui() -> None:
                 if self.stop:
                     break
                 self.progress.emit(i - 1, len(self.files), f"處理中：{f.name}")
-                r = process_any(f, sess, self.hashes, det,
-                                lambda m, i=i: self.progress.emit(i - 1, len(self.files), m))
-                if r.image is not None:
-                    ok += 1
-                    self.hashes.append(r.hash)
-                else:
-                    bad += 1
-                self.result.emit(r)
+                for r in process_any(f, sess, self.hashes, det,
+                                     lambda m, i=i: self.progress.emit(i - 1, len(self.files), m)):
+                    if r.image is not None:
+                        ok += 1
+                        self.hashes.append(r.hash)
+                    else:
+                        bad += 1
+                    self.result.emit(r)
             self.progress.emit(len(self.files), len(self.files), "完成")
             self.finished_all.emit(ok, bad)
 
