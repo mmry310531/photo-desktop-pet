@@ -27,6 +27,7 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic", ".heif", ".tif"
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".3gp", ".gif"}
 MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS
 OUT_HEIGHT = 360  # 存檔高度（顯示時再依面積縮放）
+FRAME_CUT_MAX = 0.12  # 身體貼著照片邊緣的長度超過這個比例 → 被照片切到，不要
 
 
 @dataclass
@@ -529,6 +530,19 @@ def process(path: Path, session, existing_hashes: list[int] | None = None, detec
             edges = sum([cy0 + y0 <= 1, cx0 + x0 <= 1, cy0 + y1 >= found_h - 1, cx0 + x1 >= found_w - 1])
         if edges >= 2:
             r.warning = "寵物可能被照片邊緣切到"
+        # 身體貼著「照片邊緣」多長：頭、屁股、腳被照片切掉時很長（這種去背再好也補不回來）
+        sl = a > 128
+        side = []
+        if (cx0 if found else 0) == 0:
+            side.append(sl[:, 0].sum() / H)
+        if (cy0 if found else 0) == 0:
+            side.append(sl[0, :].sum() / W)
+        if (cx1 if found else W) >= found_w:
+            side.append(sl[:, -1].sum() / H)
+        if (cy1 if found else H) >= found_h:
+            side.append(sl[-1, :].sum() / W)
+        cut_by_frame = max(side) if side else 0.0
+        r.extra["frame_cut"] = round(float(cut_by_frame), 3)
 
         # 品質分數：偵測信心、半透明殘留（背景沒去乾淨）、被切到、形狀是否合理
         solid = a > 128
@@ -542,9 +556,12 @@ def process(path: Path, session, existing_hashes: list[int] | None = None, detec
         probs = clip_pose(img)
         if probs:
             r.extra["clip"] = {k: round(v, 2) for k, v in probs.items()}
-            if probs.get("face", 0) > 0.35:
+            if probs.get("face", 0) > 0.2:
                 r.error = "太近的特寫，看不到身體（請用拍到全身的照片）"
                 return r
+        if cut_by_frame > FRAME_CUT_MAX:
+            r.error = "寵物有一部分在照片外面（身體不完整，放到桌面上會像被切掉一塊）"
+            return r
         if score < 0:
             r.error = f"品質太差，自動略過（背景沒去乾淨或被切到，分數 {score:.2f}）"
             return r
