@@ -15,7 +15,7 @@
 1. 右上角綠色 **Code → Download ZIP**，解壓縮到任何資料夾（路徑盡量不要有空格以外的奇怪符號）
 2. 雙擊 **`1-安裝.bat`**
    - 沒有 Python 會自動用 winget 裝 Python 3.12
-   - 接著自動挑最快的來源、用多條連線同時下載並安裝套件與 AI 模型（約 450MB），完成後桌面會出現「寵物訓練器」「桌面寵物」兩個捷徑
+   - 接著自動挑最快的來源、用多條連線同時下載並安裝套件與 AI 模型（約 580MB），完成後桌面會出現「寵物訓練器」「桌面寵物」兩個捷徑
 3. 訓練器會自動打開 → 把寵物照片、影片（或整個資料夾）拖進去 → 按 **一鍵產出 ▶**
 4. 程式會一路做完：去背 → 判斷姿勢 → 缺的動作用 AI 補 → 放到你的桌面 🐾
 
@@ -40,7 +40,10 @@
 每張照片會經過：
 
 1. **找動物**：YOLOX 物件偵測先找出照片裡的貓／狗在哪（旁邊的人、腳踏車、狗屋不會被剪進來）
-2. **去背**：IS-Net（勾選「高品質毛邊」改用 BiRefNet）把寵物從背景剪下來
+2. **去背**：IS-Net 先把寵物剪下來（毛邊細）；再用 **SAM（Segment Anything）** 拿偵測框當提示圈出「整隻動物」——
+   身體內部一律保留（黑毛貼深色背景不會再被挖掉），輪廓外面全部去掉（一起被剪進來的毯子、衣服會被清掉），邊緣再用 IS-Net 的細毛邊
+   - SAM 每張約需 3.3GB 記憶體；可用記憶體不足 3.8GB 時會自動跳過這步，用原本的方式去背
+   - 影片格數多，預設不精修；勾「影片也逐格精修輪廓」才會（慢很多）
 3. **分類姿勢**：依外形判斷是「坐」「站／走」還是「躺／睡」，並猜牠頭朝哪邊
 4. **整理**：去掉重複照片、過濾太近的特寫或去背失敗的照片、統一大小與亮度
 
@@ -143,7 +146,7 @@
 
 ## 常見問題
 
-- **第一次訓練很慢**：要下載去背模型（約 170MB）和偵測模型（約 36MB），之後就快了。一張照片在一般筆電上約 1～3 秒。
+- **第一次訓練很慢**：要下載去背模型（約 170MB）、偵測模型（約 36MB）和輪廓模型（約 125MB），之後就快了。一張照片在一般筆電上約 3～6 秒（輪廓精修佔大部分時間）。
 - **兔子、倉鼠、鳥等**：偵測模型認得的動物有限，認不出來時會改用整張去背並標 ⚠，請自己檢查一下。
 - **牠倒退著走**：訓練器裡對那張照片右鍵 →「左右翻轉面向」。
 - **不想讓牠爬到視窗上**：右鍵 → 取消勾選「可以跳到視窗上」。
@@ -169,13 +172,13 @@ Feed photos of your pet and it comes to life on your Windows desktop: it walks a
 
 **Install:** download the ZIP, run `1-安裝.bat` (installs Python 3.12 via winget if needed), drag photos into the trainer, click *Start*, then *Save & summon*.
 
-**Pipeline:** YOLOX detection → IS-Net / BiRefNet background removal → shape-based pose classification (sit / walk / lie) and facing → dedupe & size/brightness normalization. Motion is procedural.
+**Pipeline:** YOLOX detection → IS-Net background removal → SAM (ViT-B, box + IS-Net mask prompt) silhouette refinement, fused with IS-Net edges → shape-based pose classification (sit / walk / lie) and facing → dedupe & size/brightness normalization. Motion is procedural.
 
 ## 授權 / Credits
 
 本專案 MIT License。使用的開源元件：
 [rembg](https://github.com/danielgatis/rembg)（MIT）、
 [IS-Net / DIS](https://github.com/xuebinqin/DIS)（Apache-2.0）、
-[BiRefNet](https://github.com/ZhengPeng7/BiRefNet)（MIT）、
+[Segment Anything](https://github.com/facebookresearch/segment-anything)（Apache-2.0）、
 [YOLOX](https://github.com/Megvii-BaseDetection/YOLOX)（Apache-2.0）、
 [PySide6 / Qt](https://www.qt.io/qt-for-python)（LGPL-3.0）。

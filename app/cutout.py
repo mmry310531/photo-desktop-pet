@@ -2,7 +2,7 @@
 
 流程（每張照片）：
   1. 讀檔（含 iPhone HEIC）、依 EXIF 轉正、縮到最長邊 1280
-  2. rembg AI 模型去背（isnet-general-use；高品質模式用 BiRefNet）
+  2. rembg AI 模型去背（isnet-general-use），再用 SAM 依偵測框圈出整隻動物修輪廓
   3. 只留最大的主體（去掉旁邊雜物的碎片），修邊、緊貼裁切
   4. 依外形判斷姿勢：坐 / 站走 / 躺；並猜牠面向哪一邊
   5. 用感知雜湊去掉重複照片
@@ -129,36 +129,180 @@ def detect_pet(img: Image.Image, det) -> tuple[tuple[int, int, int, int], str, f
 
 
 def get_session(high_quality: bool = False, progress=None):
-    """載入去背模型。高品質模型（約 900MB）下載失敗時自動退回標準模型，不讓整批失敗。"""
+    """載入去背模型（IS-Net）＋輪廓模型（SAM）。
+
+    high_quality：影片的每一格也用 SAM 修輪廓（照片一律會修；影片格數多，預設不修以免太慢）。
+    以前的高品質選項是 BiRefNet，但它在一般電腦（只用 CPU）要吃 6GB 以上記憶體，實測會直接當掉，已移除。
+    """
+    global _refine_video
     import fastdl
 
     # 模型放在專案的 models/ 底下，並用多線程下載（比 rembg 內建的單線程快很多）
     os.environ["U2NET_HOME"] = str(_model_dir() / "u2net")
-    if high_quality:
-        urls, rel, md5 = fastdl.BIREFNET
-        target = _model_dir() / rel
-        try:
-            if not target.exists():
-                fastdl.download(urls, target, md5=md5, label="高品質去背模型", status=progress,
-                                callback=_dl_callback("高品質去背模型（約 900MB）", progress))
-            name = "birefnet-general"
-        except Exception as e:
-            if progress:
-                progress(f"高品質模型下載失敗（{e}），改用標準模型繼續")
-            high_quality = False
-    if not high_quality:
-        urls, rel, md5 = fastdl.ISNET
-        target = _model_dir() / rel
-        if not target.exists():
-            fastdl.download(urls, target, md5=md5, label="去背模型", status=progress,
-                            callback=_dl_callback("去背模型", progress))
-        name = "isnet-general-use"
+    urls, rel, md5 = fastdl.ISNET
+    target = _model_dir() / rel
+    if not target.exists():
+        fastdl.download(urls, target, md5=md5, label="去背模型", status=progress,
+                        callback=_dl_callback("去背模型", progress))
+    name = "isnet-general-use"
+    get_sam(progress)
+    _refine_video = bool(high_quality)
 
     from rembg import new_session
 
     if name not in _sessions:
         _sessions[name] = new_session(name)
     return _sessions[name]
+
+
+# ---------------------------------------------------------------- 輪廓精修（Segment Anything）
+# 去背模型（IS-Net）毛邊很細，但它只看「顯不顯眼」：黑毛貼著深色背景會被當成背景挖掉，
+# 顏色跟寵物很像的毯子、衣服又會被一起留下。SAM 是「給一個框，把框裡那個東西整個圈出來」的模型，
+# 對「哪些是同一隻動物」判斷得準很多。做法（類似 Matte Anything 的流程）：
+#   偵測框 + IS-Net 的結果 當提示 → SAM 圈出整隻 → 身體內部一律保留，邊緣一圈用 IS-Net 的細毛邊，外面全部去掉
+SAM_CANVAS = (684, 1024)  # 送進 SAM 的畫布（高, 寬）；跟 rembg 一樣，實測比正方形穩
+SAM_MIN_FREE_MB = 3800  # SAM 跑一張約需 3.3GB 記憶體；可用記憶體不夠時自動改用原本的方式
+_sam = None
+_sam_state = ""  # "", "ok", "lowmem", "fail"
+_refine_video = False
+
+
+def available_mb() -> int | None:
+    """目前可用的實體記憶體（MB）；拿不到時回傳 None。"""
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            m = MS()
+            m.dwLength = ctypes.sizeof(MS)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+            return int(m.ullAvailPhys // 2**20)
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        pass
+    return None
+
+
+def get_sam(progress=None):
+    """載入 SAM（約 125MB，只下載一次）。記憶體不夠或下載失敗時回傳 None，流程照常（只是不精修）。"""
+    global _sam, _sam_state
+    if _sam is not None:
+        return _sam
+    if _sam_state == "fail":
+        return None
+    free = available_mb()
+    if free is not None and free < SAM_MIN_FREE_MB:
+        if _sam_state != "lowmem" and progress:
+            progress(f"可用記憶體只剩 {free / 1024:.1f}GB，先不用輪廓精修（關掉一些程式再處理效果會更好）")
+        _sam_state = "lowmem"
+        return None
+    try:
+        import onnxruntime as ort
+
+        import fastdl
+
+        paths = []
+        for (urls, rel, md5), label in ((fastdl.SAM_ENC, "輪廓模型"), (fastdl.SAM_DEC, "輪廓模型（2/2）")):
+            f = _model_dir() / rel
+            if not f.exists():
+                fastdl.download(urls, f, md5=md5, label=label, status=progress,
+                                callback=_dl_callback(label + "（約 125MB）", progress))
+            paths.append(str(f))
+        so = ort.SessionOptions()
+        so.enable_cpu_mem_arena = False  # 跑完就把那 3GB 還給系統，不要一直佔著
+        _sam = tuple(ort.InferenceSession(p, so, providers=["CPUExecutionProvider"]) for p in paths)
+        _sam_state = "ok"
+    except Exception as e:
+        _sam_state = "fail"
+        if progress:
+            progress(f"輪廓模型載入失敗（{type(e).__name__}），改用基本去背繼續")
+        return None
+    return _sam
+
+
+def _keep_big(m: np.ndarray, frac: float) -> np.ndarray:
+    from scipy import ndimage
+
+    lab, n = ndimage.label(m)
+    if n <= 1:
+        return m
+    sz = ndimage.sum(m, lab, range(1, n + 1))
+    return np.isin(lab, [i + 1 for i, v in enumerate(sz) if v >= sz.max() * frac])
+
+
+def sam_mask(img: Image.Image, box, raw: np.ndarray) -> np.ndarray | None:
+    """回傳 SAM 認為是寵物的機率圖（0～1，跟 img 一樣大）；不能用時回傳 None。"""
+    if _sam is None and get_sam() is None:
+        return None
+    enc, dec = _sam
+    free = available_mb()
+    if free is not None and free < SAM_MIN_FREE_MB - 600:
+        return None
+    w, h = img.size
+    CH, CW = SAM_CANVAS
+    s = min(CW / w, CH / h)
+    sw, sh = round(w * s), round(h * s)
+    can = np.zeros((CH, CW, 3), np.float32)
+    can[:sh, :sw] = np.asarray(img.convert("RGB").resize((sw, sh), Image.BILINEAR), np.float32)
+    emb = enc.run(None, {enc.get_inputs()[0].name: can})[0]
+    # 提示：偵測框（左上、右下兩個角）＋ IS-Net 的結果（低解析度遮罩）
+    b = np.asarray(box, np.float32) * s
+    coords = np.array([[[b[0], b[1]], [b[2], b[3]], [0, 0]]], np.float32)
+    labels = np.array([[2, 3, -1]], np.float32)
+    lw, lh = max(1, round(sw / 4)), max(1, round(sh / 4))
+    prior = np.full((1, 1, 256, 256), -8, np.float32)
+    r = np.asarray(Image.fromarray(raw).resize((lw, lh), Image.BILINEAR), np.float32) / 255
+    prior[0, 0, :lh, :lw] = (r - 0.5) * 16
+    _, _, low = dec.run(None, {"image_embeddings": emb, "point_coords": coords, "point_labels": labels,
+                               "mask_input": prior, "has_mask_input": np.ones(1, np.float32),
+                               "orig_im_size": np.array([CH, CW], np.float32)})
+    # 用低解析度的原始輸出自己放大（模型內建的放大會出現格子狀雜點）
+    L = low[0, 0][:lh, :lw].astype(np.float32)
+    L = np.asarray(Image.fromarray(L, "F").resize((w, h), Image.BILINEAR))
+    return 1 / (1 + np.exp(-np.clip(L, -20, 20)))
+
+
+def refine_alpha(raw: np.ndarray, p: np.ndarray) -> np.ndarray:
+    """IS-Net 的透明度（毛邊細）＋ SAM 的整體輪廓（不漏身體、不帶毯子）合成最後的透明度。"""
+    from scipy import ndimage
+
+    H, W = raw.shape
+    d = max(H, W)
+    p = ndimage.gaussian_filter(p, sigma=d / 256 * 1.2)
+    M = ndimage.binary_fill_holes(_keep_big(p > 0.5, 0.2))
+    r = max(2, int(0.015 * d))
+    core = ndimage.binary_erosion(M, iterations=r)        # 身體內部：一定保留（黑毛不會再被挖掉）
+    band = ndimage.binary_dilation(M, iterations=r)       # 輪廓外一小圈：只留 IS-Net 有把握的細毛
+    rawf = raw.astype(np.float32)
+    lo = np.clip((rawf - 35) / (150 - 35), 0, 1)
+    soft = np.clip((p - 0.5) * 4, 0, 1)
+    a = np.where(core, 1.0, np.where(M, np.maximum(lo, soft), np.where(band, lo * (rawf > 60), 0.0)))
+    a = (a * 255).astype(np.uint8)
+    solid = ndimage.binary_fill_holes(_keep_big(a > 128, 0.15))
+    a = np.where(ndimage.binary_dilation(solid, iterations=2), a, 0).astype(np.uint8)
+    a[solid & (a < 128)] = 255
+    return a
+
+
+def matte(img: Image.Image, raw: np.ndarray, box, refine: bool = True) -> tuple[np.ndarray, bool]:
+    """最後的透明度。有 SAM 就精修，沒有就用原本的整理方式。回傳 (alpha, 有沒有精修)。"""
+    if refine and box is not None:
+        try:
+            p = sam_mask(img, box, raw)
+            if p is not None and (p > 0.5).sum() > raw.size * 0.02:
+                return refine_alpha(raw, p), True
+        except Exception:  # 精修失敗不影響整批
+            pass
+    return clean_alpha(raw), False
 
 
 def collect_images(paths) -> list[Path]:
@@ -372,7 +516,10 @@ def process(path: Path, session, existing_hashes: list[int] | None = None, detec
             return r
 
         raw = a.copy()
-        a = clean_alpha(a)
+        a, refined = matte(img, a, (bx0, by0, bx1, by1) if found else None)
+        r.extra["refined"] = refined
+        if refined:
+            raw = a  # 背景的霧已經被輪廓去掉，品質分數改看最後結果
         ys, xs = np.where(a > 24)
         y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
         H, W = a.shape
@@ -480,6 +627,8 @@ def _cut_frame(img, session, detector, last_box):
     a = _largest_component(a)
     if (a > 128).sum() < (bx1 - bx0) * (by1 - by0) * 0.2:
         return None
+    if _refine_video:
+        a, _ = matte(crop, a, (bx0 - cx0, by0 - cy0, bx1 - cx0, by1 - cy0))
     rgba = np.dstack([np.asarray(cut)[:, :, :3], a])
     return a, box, rgba
 

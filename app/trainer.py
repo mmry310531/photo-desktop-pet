@@ -1,7 +1,7 @@
 """寵物訓練器：把一堆寵物照片「餵」進來，變成桌面寵物的姿勢庫。
 
 GUI：python trainer.py
-CLI：python trainer.py --cli 寵物名字 照片資料夾 [更多檔案或資料夾...] [--hq]
+CLI：python trainer.py --cli 寵物名字 照片資料夾 [更多檔案或資料夾...] [--hq（影片也精修輪廓）]
 """
 from __future__ import annotations
 
@@ -66,7 +66,7 @@ def run_cli(argv: list[str]) -> None:
     hq = "--hq" in argv
     argv = [a for a in argv if a != "--hq"]
     if len(argv) < 2:
-        print("用法：python trainer.py --cli 寵物名字 照片資料夾 [...] [--hq]")
+        print("用法：python trainer.py --cli 寵物名字 照片資料夾 [...] [--hq（影片也精修輪廓）]")
         sys.exit(1)
     name, paths = safe_name(argv[0]), argv[1:]
     pack = load_pack(name)
@@ -222,7 +222,7 @@ def run_gui() -> None:
             self.name.setMinimumWidth(200)
             self.name.currentTextChanged.connect(self.load_existing)
             top.addWidget(self.name)
-            self.hq = QCheckBox("高品質毛邊（要另外下載約 900MB 的模型，處理也慢很多；一般不需要）")
+            self.hq = QCheckBox("影片也逐格精修輪廓（照片一律會修；影片會慢很多）")
             top.addWidget(self.hq)
             top.addStretch()
             lay.addLayout(top)

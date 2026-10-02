@@ -47,7 +47,13 @@ YOLOX = (["https://huggingface.co/skillsafe-ai/yolox-s/resolve/main/yolox_s.onnx
           "https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_s.onnx",
           "https://hf-mirror.com/skillsafe-ai/yolox-s/resolve/main/yolox_s.onnx"],
          "yolox_s.onnx", "162fa8fdc3979a395018701b60ff02fe")
-MODELS = [ISNET, YOLOX]
+# Segment Anything（ViT-B，Meta，Apache-2.0）：用偵測框當提示，抓出「整隻動物」的輪廓，
+# 補回去背模型漏掉的黑毛、去掉被一起剪進來的毯子。檔案是 rembg 官方發布的 ONNX。
+SAM_ENC = (["https://github.com/danielgatis/rembg/releases/download/v0.0.0/sam_vit_b_01ec64.encoder.quant.onnx"],
+           "sam/sam_vit_b_01ec64.encoder.quant.onnx", "26fc0e01d2fa34ed2d3f91259118482d")
+SAM_DEC = (["https://github.com/danielgatis/rembg/releases/download/v0.0.0/sam_vit_b_01ec64.decoder.onnx"],
+           "sam/sam_vit_b_01ec64.decoder.onnx", "c4218b16ec1cb09889fcd6eb7a42a7c9")
+MODELS = [ISNET, YOLOX, SAM_ENC, SAM_DEC]
 STALL_SECS = 60  # 這麼久完全沒進度就換來源（已下載的部分會保留）
 
 
