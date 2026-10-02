@@ -128,10 +128,11 @@ def detect_pet(img: Image.Image, det) -> tuple[tuple[int, int, int, int], str, f
     return box, PET_CLASSES[ids[int(best_cls[i])]], float(best[i])
 
 
-def get_session(high_quality: bool = False, progress=None):
+def get_session(fast: bool = False, progress=None):
     """載入去背模型（IS-Net）＋輪廓模型（SAM）。
 
-    high_quality：影片的每一格也用 SAM 修輪廓（照片一律會修；影片格數多，預設不修以免太慢）。
+    照片和影片的每一格都會用 SAM 修輪廓（影片裡貓的頭常常貼著深色背景或雜物，只靠 IS-Net 會缺頭缺腳）。
+    fast=True：影片不精修（快很多，品質較粗）。照片一律精修。
     以前的高品質選項是 BiRefNet，但它在一般電腦（只用 CPU）要吃 6GB 以上記憶體，實測會直接當掉，已移除。
     """
     global _refine_video
@@ -146,7 +147,7 @@ def get_session(high_quality: bool = False, progress=None):
                         callback=_dl_callback("去背模型", progress))
     name = "isnet-general-use"
     get_sam(progress)
-    _refine_video = bool(high_quality)
+    _refine_video = not fast
 
     from rembg import new_session
 
@@ -632,7 +633,12 @@ def _cut_frame(img, session, detector, last_box):
     else:
         a = clean_alpha(a)  # 去掉背景殘留的半透明「霧」、補回黑毛
     rgba = np.dstack([np.asarray(cut)[:, :, :3], a])
-    return a, box, rgba
+    # 身體貼著「畫面邊緣」的長度（頭或身體跑出畫面外時會很長；只有尾巴尖碰到時很短）
+    H, W = a.shape
+    solid = a > 128
+    touch = max([solid[:, 0].sum() / H if cx0 == 0 else 0, solid[:, -1].sum() / H if cx1 == img.width else 0,
+                 solid[0, :].sum() / W if cy0 == 0 else 0, solid[-1, :].sum() / W if cy1 == img.height else 0])
+    return a, box, rgba, touch
 
 
 def _best_loop(masks, min_len=6):
@@ -660,6 +666,30 @@ def _pose_of(frames_alpha):
     return max(set(votes), key=votes.count)
 
 
+def _cutout_pose(imgs, default: str) -> str:
+    """用去背後的圖判斷姿勢：放在素色背景上給 CLIP 看「是不是趴／躺」（這點它很準），
+    坐和站則看外形比例（CLIP 常把坐著看成站著；站著走路的貓明顯比較長）。"""
+    if not imgs:
+        return default
+    acc, ars = {}, []
+    for im in imgs:
+        a = np.asarray(im.getchannel("A")) > 128
+        ys, xs = np.where(a)
+        if len(xs):
+            ars.append((xs.max() - xs.min() + 1) / (ys.max() - ys.min() + 1))
+        bg = Image.new("RGB", im.size, (124, 116, 104))
+        bg.paste(im, (0, 0), im)
+        p = clip_pose(bg)
+        for kk, v in (p or {}).items():
+            acc[kk] = acc.get(kk, 0) + v
+    ar = float(np.median(ars)) if ars else 1.5
+    if acc and acc.get("lie", 0) >= max(acc.get("walk", 0), acc.get("sit", 0)):
+        return "lie"
+    if not acc and ar > 2.1:
+        return "lie"
+    return "sit" if ar < 1.4 else "walk"
+
+
 def process_video(path: Path, session, detector, progress=None, force: dict | None = None,
                   max_secs=VIDEO_MAX_SECS, frames: list | None = None) -> CutResult:
     """把一段寵物影片變成連續動畫。
@@ -669,12 +699,13 @@ def process_video(path: Path, session, detector, progress=None, force: dict | No
     """
     r = CutResult(source=str(path))
     try:
+        force_keep = bool(force and force.get("seamless"))  # AI 影片：構圖是程式排的，不會出界
         if frames is None:
             frames = read_video_frames(path, max_secs=max_secs)
         if len(frames) < 4:
             r.error = "影片太短"
             return r
-        cuts, boxes = [], []
+        cuts, boxes, idx = [], [], []
         last = None
         for i, fr in enumerate(frames):
             if progress:
@@ -682,10 +713,13 @@ def process_video(path: Path, session, detector, progress=None, force: dict | No
             c = _cut_frame(fr, session, detector, last)
             if c is None:
                 continue
-            a, box, rgba = c
+            a, box, rgba, touch = c
             last = box
+            if touch > 0.12 and not force_keep:
+                continue  # 頭或身體有一塊在畫面外，這格不要
             cuts.append((a, rgba))
             boxes.append(box)
+            idx.append(i)
         if len(cuts) < 4:
             r.error = "影片裡找不到清楚的寵物"
             return r
@@ -707,11 +741,25 @@ def process_video(path: Path, session, detector, progress=None, force: dict | No
 
         def iou(p, q):
             return np.logical_and(p, q).sum() / max(np.logical_or(p, q).sum(), 1)
-        for i in range(1, len(tight) - 1):
-            if keep[i] and iou(shapes[i], shapes[i - 1]) < 0.55 and iou(shapes[i], shapes[i + 1]) < 0.55:
-                keep[i] = False
+        for i in range(len(tight)):
+            # 跟前後幾格的「多數形狀」比：連續好幾格都缺頭時，只跟前後一格比會抓不到
+            nb = [shapes[j] for j in range(max(0, i - 4), min(len(tight), i + 5)) if j != i and keep[j]]
+            if len(nb) >= 2:
+                consensus = np.mean(nb, axis=0) > 0.5
+                if iou(shapes[i], consensus) < 0.72:
+                    keep[i] = False
         tight = [t for t, k in zip(tight, keep) if k]
         boxes = [bx for bx, k in zip(boxes, keep) if k]
+        idx = [x for x, k in zip(idx, keep) if k]
+        # 丟掉壞格後只留最長的「連續」一段（中間最多跳 1 格），播放時才不會突然跳一下
+        if not force_keep and len(idx) > 1:
+            runs, st = [], 0
+            for k in range(1, len(idx) + 1):
+                if k == len(idx) or idx[k] - idx[k - 1] > 2:
+                    runs.append((st, k))
+                    st = k
+            a0, a1 = max(runs, key=lambda ab: ab[1] - ab[0])
+            tight, boxes = tight[a0:a1], boxes[a0:a1]
         if len(tight) < 4:
             r.error = "影片裡寵物被擋住或去背失敗太多格"
             return r
@@ -745,6 +793,15 @@ def process_video(path: Path, session, detector, progress=None, force: dict | No
             kind = force["kind"]
             start_pose, end_pose = force.get("from", start_pose), force.get("to", end_pose)
             facing = force.get("facing", facing)
+            if force.get("mined"):  # 手機影片：去背後再判斷一次姿勢（掃描時背景雜亂，常判錯）
+                if kind == "loop":
+                    start_pose = end_pose = _cutout_pose([f for f, _ in out_frames[::3]], start_pose)
+                else:  # 轉場：頭尾各看幾格；兩邊判成一樣時（例如趴低身子走路）保留掃描時的判斷
+                    k = max(2, min(5, n // 3))
+                    a = _cutout_pose([f for f, _ in out_frames[:k]], start_pose)
+                    b = _cutout_pose([f for f, _ in out_frames[-k:]], end_pose)
+                    if a != b:
+                        start_pose, end_pose = a, b
         elif abs(travel) > 0.5:  # 在畫面裡移動了 → 走路循環
             kind, start_pose = "loop", "walk"
             end_pose = "walk"
@@ -813,7 +870,8 @@ def scan_video(frames, detector, progress=None, name=""):
         mx, my = (x1 - x0) * 0.1, (y1 - y0) * 0.1
         crop = im.crop((max(0, x0 - mx), max(0, y0 - my), min(im.width, x1 + mx), min(im.height, y1 + my)))
         probs = clip_pose(crop)
-        edge = x0 <= 2 or y0 <= 2 or x1 >= im.width - 2 or y1 >= im.height - 2
+        # 框完全貼死畫面邊緣才算出界；只是尾巴尖碰到邊的，等去背後再看身體有多少貼著邊
+        edge = x0 <= 1 or y0 <= 1 or x1 >= im.width - 1 or y1 >= im.height - 1
         info.append({"box": (x0, y0, x1, y1), "h": y1 - y0, "pose": _frame_pose(probs, (x0, y0, x1, y1)),
                      "ok": conf > 0.4 and not edge and (y1 - y0) > im.height * 0.12})
     # 姿勢做時間上的平滑（前後 7 格多數決），避免一兩格判錯就切斷
@@ -890,7 +948,7 @@ def process_video_clips(path: Path, session, detector, progress=None) -> list[Cu
             sub = sub[:LOOP_MAX + 10]  # 循環段太長只取前面一段，_best_loop 會在裡面找頭尾最接的
         r = process_video(path, session, detector,
                           (lambda m, k=k: progress(f"{m}（片段 {k}/{len(plans)}）")) if progress else None,
-                          force={"kind": c["kind"], "from": c["from"], "to": c["to"]}, frames=sub)
+                          force={"kind": c["kind"], "from": c["from"], "to": c["to"], "mined": True}, frames=sub)
         r.source = f"{path}#{c['start'] / VIDEO_FPS:.1f}-{c['end'] / VIDEO_FPS:.1f}s"
         r.extra["segment"] = [round(c["start"] / VIDEO_FPS, 1), round(c["end"] / VIDEO_FPS, 1)]
         out.append(r)

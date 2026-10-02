@@ -1,7 +1,7 @@
 """寵物訓練器：把一堆寵物照片「餵」進來，變成桌面寵物的姿勢庫。
 
 GUI：python trainer.py
-CLI：python trainer.py --cli 寵物名字 照片資料夾 [更多檔案或資料夾...] [--hq（影片也精修輪廓）]
+CLI：python trainer.py --cli 寵物名字 照片資料夾 [更多檔案或資料夾...] [--fast（影片不精修輪廓，較快）]
 """
 from __future__ import annotations
 
@@ -63,16 +63,16 @@ def save_results(name: str, results, pack: dict) -> dict:
 def run_cli(argv: list[str]) -> None:
     from cutout import collect_images, get_detector, get_session, process_any
 
-    hq = "--hq" in argv
-    argv = [a for a in argv if a != "--hq"]
+    fast = "--fast" in argv
+    argv = [a for a in argv if a not in ("--fast", "--hq")]
     if len(argv) < 2:
-        print("用法：python trainer.py --cli 寵物名字 照片資料夾 [...] [--hq（影片也精修輪廓）]")
+        print("用法：python trainer.py --cli 寵物名字 照片資料夾 [...] [--fast（影片不精修輪廓，較快）]")
         sys.exit(1)
     name, paths = safe_name(argv[0]), argv[1:]
     pack = load_pack(name)
     files = collect_images(paths)
     print(f"找到 {len(files)} 個照片／影片，載入 AI 模型…")
-    sess = get_session(hq)
+    sess = get_session(fast)
     det = get_detector(print)
     try:
         from cutout import get_clip
@@ -224,7 +224,7 @@ def run_gui() -> None:
             self.name.setMinimumWidth(200)
             self.name.currentTextChanged.connect(self.load_existing)
             top.addWidget(self.name)
-            self.hq = QCheckBox("影片也逐格精修輪廓（照片一律會修；影片會慢很多）")
+            self.hq = QCheckBox("快速模式：影片不精修輪廓（快很多，但偶爾會缺頭缺腳）")
             top.addWidget(self.hq)
             top.addStretch()
             lay.addLayout(top)
