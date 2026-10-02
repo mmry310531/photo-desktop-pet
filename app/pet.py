@@ -159,6 +159,8 @@ class Unit:
 
     def __init__(self, frames, fps, pose, kind="still", to=None):
         self.frames, self.fps, self.pose, self.kind, self.to = frames, fps or 10, pose, kind, to
+        self.real = False
+        self.speed = 0.0
         self.w = max(f[3] for f in frames)
         self.h = max(f[4] for f in frames)
         # 舊程式碼相容
@@ -226,6 +228,10 @@ def load_sprites(name, settings, dpr):
         maxh = max(im.height for im, _ in ims)
         maxw = max(im.width for im, _ in ims)
         sc = min(sc, base * 1.5 / maxh, base * 2.4 / maxw)
+        if m.get("real"):
+            # 寫實片段：全部共用同一個比例（坐姿在畫布中約佔 50% 高 → 顯示成 base*1.3 高）
+            sc = base * 1.3 / (480 * 0.5)
+            gain = 1.0
         facing_right = m.get("facing", "right") == "right"
         frames = []
         for im, ax in ims:
@@ -245,13 +251,24 @@ def load_sprites(name, settings, dpr):
         kind = m.get("kind") or ("loop" if len(frames) > 1 else "still")
         if kind == "trans" and m.get("to") in POSES_ALL and m.get("to") != pose:
             u = Unit(frames, m.get("fps"), pose, "trans", m["to"])
+            u.real = bool(m.get("real"))
             trans.setdefault((pose, m["to"]), []).append((u, False))
             trans.setdefault((m["to"], pose), []).append((u, True))  # 倒放：坐下 ↔ 起身
             # 轉場的頭尾也可以當靜止姿勢
             loops[pose].append(Unit([frames[0]], 10, pose))
             loops[m["to"]].append(Unit([frames[-1]], 10, m["to"]))
         else:
-            loops.setdefault(pose, []).append(Unit(frames, m.get("fps"), pose, kind))
+            u = Unit(frames, m.get("fps"), pose, kind)
+            u.real = bool(m.get("real"))
+            u.speed = (m.get("px_per_s") or 0) * sc  # 寫實走路：螢幕上的移動速度＝影片裡的步速，腳不會打滑
+            loops.setdefault(pose, []).append(u)
+    # 有寫實影片的姿勢就只用寫實影片（混用照片會大小、光線不一致，一眼假）
+    for k in POSES_ALL:
+        real = [u for u in loops.get(k, []) if getattr(u, "real", False)]
+        if real:
+            loops[k] = real
+    if any(getattr(u, "real", False) for v in trans.values() for u, _ in v):
+        trans = {k: [(u, r) for u, r in v if getattr(u, "real", False)] or v for k, v in trans.items()}
     allu = [u for v in loops.values() for u in v]
     loops["walk"] = loops["walk"] or loops["sit"] or allu
     loops["sit"] = loops["sit"] or loops["walk"]
@@ -495,7 +512,9 @@ class Pet(QWidget):
             if random.random() < 0.6:
                 self.dir = random.choice([-1, 1])
             self.set_state("walk", random.uniform(2.5, 8))
-            if self.sprite.animated:  # 用影片走路：速度配合步伐
+            if self.sprite.speed:  # 寫實走路：跟影片裡的步速一樣
+                self.speed = self.sprite.speed * (random.uniform(0.9, 1.1) if random.random() < 0.85 else 1.6)
+            elif self.sprite.animated:  # 用影片走路：速度配合步伐
                 self.speed = self.sprite.w * 0.9 * (random.uniform(0.8, 1.15) if random.random() < 0.8 else 1.9)
             else:
                 self.speed = random.uniform(55, 110) if random.random() < 0.8 else random.uniform(180, 260)
@@ -508,7 +527,8 @@ class Pet(QWidget):
             self.set_state("sleep", random.uniform(15, 50) if idle < 90 else random.uniform(60, 180))
         elif st == "chase":
             self.set_state("chase", 6)
-            self.speed = (self.sprite.w * 1.6) if self.sprite.animated else random.uniform(150, 230)
+            self.speed = (self.sprite.speed * 1.6 if self.sprite.speed else
+                          (self.sprite.w * 1.6) if self.sprite.animated else random.uniform(150, 230))
         elif st == "climb":
             self.jump_to(self.climb_target())
 
@@ -546,7 +566,9 @@ class Pet(QWidget):
         # 動畫時間：走路的影片會跟移動速度同步（腳步不會滑），掉落／被拎著時暫停
         if self.state not in ("fall", "drag"):
             rate = 1.0
-            if self.state in ("walk", "chase") and self.sprite.animated:
+            if self.state in ("walk", "chase") and self.sprite.speed:
+                rate = max(0.4, min(2.5, self.speed / self.sprite.speed))
+            elif self.state in ("walk", "chase") and self.sprite.animated:
                 rate = max(0.4, min(2.5, self.speed / max(self.sprite.w * 0.9, 1)))
             elif self.state == "sleep":
                 rate = 0.8

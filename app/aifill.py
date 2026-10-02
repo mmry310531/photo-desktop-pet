@@ -149,7 +149,7 @@ class HuggingFace:
                 self._client = Client(self.space, hf_token=self.token, download_files=dl, verbose=False)
         return self._client
 
-    def generate(self, start: Path, end: Path, prompt: str, out: Path, status=None) -> Path:
+    def generate(self, start: Path, end: Path, prompt: str, out: Path, status=None, secs: float = CLIP_SECS) -> Path:
         from gradio_client import handle_file
 
         if status:
@@ -157,7 +157,7 @@ class HuggingFace:
         try:
             res = self.client().predict(
                 handle_file(str(start)), handle_file(str(end)), prompt, NEGATIVE,
-                CLIP_SECS, 8, 1, 1, 42, True, api_name="/generate_video")
+                secs, 8, 1, 1, 42, True, api_name="/generate_video")
         except Exception as e:
             msg = str(e)
             if "quota" in msg.lower() or "GPU" in msg:
@@ -195,11 +195,11 @@ class Fal:
         Image.open(p).convert("RGB").save(buf, "JPEG", quality=92)
         return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
 
-    def generate(self, start: Path, end: Path, prompt: str, out: Path, status=None) -> Path:
+    def generate(self, start: Path, end: Path, prompt: str, out: Path, status=None, secs: float = CLIP_SECS) -> Path:
         body = {
             "image_url": self._data_uri(start), "end_image_url": self._data_uri(end),
             "prompt": prompt, "negative_prompt": NEGATIVE, "resolution": "480p",
-            "num_frames": int(CLIP_SECS * 16) + 1, "frames_per_second": 16, "aspect_ratio": "16:9",
+            "num_frames": min(161, int(secs * 16) + 1), "frames_per_second": 16, "aspect_ratio": "16:9",
         }
         sub = self._req(f"https://queue.fal.run/{FAL_ENDPOINT}", body)
         t0 = time.time()

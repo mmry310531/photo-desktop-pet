@@ -30,6 +30,9 @@ def save_results(name: str, results, pack: dict) -> dict:
         used.add(fname)
         entry = {"file": fname, "pose": r.pose, "facing": r.facing,
                  "area": r.area, "hash": str(r.hash), "source": Path(r.source).name}
+        for k in ("score", "clip"):
+            if k in r.extra:
+                entry[k] = r.extra[k]
         det = (r.extra.get("detected") or "").split(" ")[0]
         if det:
             from aifill import SPECIES
@@ -165,26 +168,31 @@ def run_gui() -> None:
             self.last_error = ""
 
         def run(self):
-            import aifill
-            from cutout import get_detector, get_session
+            import realclips
+            from cutout import get_session
 
             n = len(self.jobs)
             ok = bad = 0
             try:
                 sess = get_session(False, lambda m: self.progress.emit(0, n, m))
-                det = get_detector(lambda m: self.progress.emit(0, n, m))
             except Exception as e:
                 self.last_error = f"模型下載中斷（已下載的部分會保留，再按一次會接著下載）：{e}"
                 self.finished_all.emit(0, n)
                 return
+            animal = "cat"
+            try:
+                import aifill
+                from common import load_pack
+
+                animal = aifill._animal(load_pack(self.name))
+            except Exception:
+                pass
             for i, j in enumerate(self.jobs):
-                say = (lambda m, i=i, j=j: self.progress.emit(i, n, f"[{i + 1}/{n}] {j.label}：{m}"))
+                say = (lambda m, i=i, j=j: self.progress.emit(i, n, f"[{i + 1}/{n}] {m}"))
                 try:
-                    r = aifill.run_job(self.name, j, self.backend, sess, det, say)
-                    if r.image is None:
-                        raise RuntimeError(r.error)
+                    realclips.generate(self.name, self.backend, sess, which=[j.key], status=say, animal=animal)
                     ok += 1
-                    self.result.emit(r)
+                    self.result.emit("reload")
                 except Exception as e:
                     bad += 1
                     self.last_error = f"{j.label} 失敗：{e}"
@@ -465,6 +473,9 @@ def run_gui() -> None:
             self.bar.setMaximum(max(n, 1)); self.bar.setValue(i); self.status.setText(msg)
 
         def on_result(self, r):
+            if isinstance(r, str) and r == "reload":  # 寫實片段已直接存進寵物包
+                self.load_existing(safe_name(self.name.currentText()))
+                return
             if r.image is None:
                 self.status.setText(f"{Path(r.source).name}：{r.error}")
                 return
@@ -491,7 +502,9 @@ def run_gui() -> None:
             if self.auto_ai.isChecked():
                 import aifill
 
-                jobs = aifill.missing_jobs(name)
+                import realclips
+
+                jobs = realclips.missing(name)
                 if jobs:
                     if st.get("ai_backend") == "fal" and st.get("fal_key"):
                         backend = aifill.Fal(st["fal_key"])
@@ -614,16 +627,18 @@ def run_gui() -> None:
             name = self.save_only()  # 先存檔，才知道還缺什麼
             if not name:
                 return
-            jobs = aifill.missing_jobs(name)
+            import realclips
+
+            jobs = realclips.missing(name)
             if not jobs:
-                QMessageBox.information(self, "動作都齊了", "走路、坐、趴的循環動作和轉場都已經有了，不需要 AI 補。")
+                QMessageBox.information(self, "動作都齊了", "寫實動作影片都已經做好了（或缺少趴姿／坐姿照片當起點）。")
                 return
             st = load_settings()
             dlg = QDialog(self)
-            dlg.setWindowTitle("🪄 AI 補齊動作")
+            dlg.setWindowTitle("🎬 AI 寫實動作")
             v = QVBoxLayout(dlg)
-            v.addWidget(QLabel("AI 會用你的照片當「開始畫面」和「結束畫面」，生成中間的自然動作。\n"
-                               "這隻寵物還缺這些（勾選要生成的）："))
+            v.addWidget(QLabel("AI 會從你最好的一張趴姿、一張坐姿照片出發，生成連續的真實動作影片，\n"
+                               "每段的開頭結尾都接在同一張照片上，切換動作時不會跳。還缺這些（勾選要生成的）："))
             checks = []
             for j in jobs:
                 c = QCheckBox(j.label)
@@ -655,8 +670,9 @@ def run_gui() -> None:
 
             def upd():
                 n = sum(c.isChecked() for c, _ in checks)
-                cost.setText(f"預估費用：約 US${aifill.Fal.cost(n):.2f}（{n} 段 × {aifill.CLIP_SECS} 秒 × US${aifill.FAL_PRICE_PER_SEC}/秒）"
-                             if fal.isChecked() else f"共 {n} 段，免費（用你的 Hugging Face 每日額度）")
+                secs = sum(realclips.CLIPS[j.key][2] for c, j in checks if c.isChecked())
+                cost.setText(f"預估費用：約 US${secs * aifill.FAL_PRICE_PER_SEC:.2f}（共 {secs:.0f} 秒影片 × US${aifill.FAL_PRICE_PER_SEC}/秒）"
+                             if fal.isChecked() else f"共 {n} 段，免費（每天約 1～2 段，用完隔天按一次會接著做）")
             for c, _ in checks:
                 c.toggled.connect(upd)
             fal.toggled.connect(upd)
